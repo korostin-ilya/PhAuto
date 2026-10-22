@@ -1,0 +1,13 @@
+services:
+  pano-pipeline:
+    build: .
+    image: drone-pano-pipeline:latest
+    volumes:
+      - ./pano:/app/input
+      - ./sky:/app/sky_templates
+      - ./sky_catalog.json:/app/sky_catalog.json
+      - ./config.yaml:/app/config.yaml
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./tests:/app/tests
+    entrypoint: ["python3", "-u", "scripts/run_pipeline.py"]

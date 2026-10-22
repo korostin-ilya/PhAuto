@@ -1,0 +1,40 @@
+# Python кэш и скомпилированные файлы
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Виртуальные окружения
+.venv/
+venv/
+ENV/
+env/
+
+# Исходные серии снимков БПЛА, выходные панорамы и локальные бинарники
+pano/
+sky/
+input/
+output/
+bin/
+
+# Временные файлы сшивки Hugin / Multiblend
+*.pto
+*.pto.mk
+*.tif
+*.tiff
+
+# Временные и черновые скрипты
+test.py
+test2.py
+matrix.txt
+
+# Системные файлы ОС и IDE
+desktop.ini
+Thumbs.db
+.DS_Store
+*.lnk
+.vscode/
+.idea/

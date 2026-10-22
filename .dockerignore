@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+pano/
+sky/
+sky_templates/
+output/
+bin/
+.git/
+*.tif
+*.tiff

@@ -1,0 +1,85 @@
+panorama:
+  width: 15000
+  height: 7500
+  horizon_y: 3750
+  jpeg_quality: 96
+  subsampling: 0
+  output_suffix: "_full.jpeg"
+  skip_existing_output: true
+
+stitcher:
+  default_hfov: 73.7
+  input_filter:
+    min_raw_frames: 5
+    exclude_stitched_panoramas: true
+    require_gimbal_xmp: true
+    duplicate_angle_threshold_deg: 3.0
+    default_prestitched_zenith_cutoff_y: 2600
+  sky_filter_pitch_threshold_deg: -26.0
+  sky_horizon_margin_px: 15.0
+  cpclean_threshold: 1.5
+  max_angle_deviation_deg: 3.5
+  max_eev_deviation: 2.5
+  use_gpu_nona: false
+  use_vig_optimize: false
+  use_cropped_tiff: true
+  cpfind_args:
+    - "--prealigned"
+  multiblend_args:
+    - "--wrap"
+    - "--wideblend"
+    - "--compression=LZW"
+    - "--all-threads"
+
+sky_index:
+  sun_strip_half_width: 200
+  edge_strip_width: 200
+  gaussian_sigma_px: 50.0
+  overcast_delta_l_threshold: 8.0
+  overcast_peak_l_threshold: 94.0
+  sun_top_percentile: 95.0
+  num_slices: 20
+  band_y_min: 2850
+  band_y_max: 3650
+  num_grad_points: 6
+  hist_bins: 16
+  dog_sigma1: 15.0
+  dog_sigma2: 60.0
+
+sky_matcher:
+  top_k: 5
+  sobel_percentile_cutoff: 75.0
+  l_min_percentile_cutoff: 45.0
+  overcast_ev_spread_threshold: 1.15
+  overcast_pano_delta_l_threshold: 9.0
+  weights:
+    lab_grad: 1.0
+    emd_l: 0.6
+    emd_b: 1.0
+    dog_energy: 1.8
+    sun_elevation: 1.8
+    overcast_penalty: 25.0
+  micro_blend:
+    width: 600
+    height: 150
+    seam_grad_weight: 1.0
+    color_shift_weight: 0.35
+
+sky_blender:
+  top_edge_margin_px: 140
+  cutoff_feather_px: 220
+  void_feather_px: 200
+  top_edge_smooth_sigma_px: 80.0
+  num_azimuth_sectors: 20
+  mahalanobis_sky_threshold: 3.2
+  mahalanobis_obj_threshold: 6.5
+  edge_gradient_weight: 0.45
+  guided_filter_radius: 15
+  guided_filter_eps: 0.001
+  guided_filter_subsample: 4
+  reinhard_strength_horizon: 0.90
+  reinhard_std_weight: 0.55
+  reinhard_decay_power: 1.4
+  reinhard_zenith_weight_ratio: 0.42
+  max_ab_shift: 18.0
+  max_l_shift: 22.0
