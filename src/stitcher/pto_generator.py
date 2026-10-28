@@ -1,4 +1,4 @@
-"""Генерация initial.pto, динамический расчет HFOV, фильтрация точек неба и Sanity Check углов."""
+"""Генерация initial.pto, динамический расчет HFOV, фильтрация точек неба, 3D-выравнивание горизонта и Sanity Check углов."""
 
 from __future__ import annotations
 
@@ -39,6 +39,27 @@ def _euler_to_rotation_matrix(yaw_deg: float, pitch_deg: float, roll_deg: float)
     return ry @ rx @ rz
 
 
+def _rotation_matrix_to_euler(rot: np.ndarray) -> tuple[float, float, float]:
+    """
+    Извлекает углы Эйлера (yaw_deg, pitch_deg, roll_deg) из 3x3 матрицы поворота
+    R = Ry(yaw) * Rx(pitch) * Rz(roll).
+    """
+    sp = max(-1.0, min(1.0, float(-rot[1, 2])))
+    p_rad = math.asin(sp)
+    cp = math.cos(p_rad)
+    if abs(cp) > 1e-5:
+        y_rad = math.atan2(float(rot[0, 2]), float(rot[2, 2]))
+        r_rad = math.atan2(float(rot[1, 0]), float(rot[1, 1]))
+    else:
+        y_rad = math.atan2(float(-rot[2, 0]), float(rot[0, 0]))
+        r_rad = 0.0
+    return (
+        _wrap_yaw(math.degrees(y_rad)),
+        max(-90.0, min(90.0, math.degrees(p_rad))),
+        _wrap_yaw(math.degrees(r_rad)),
+    )
+
+
 def _rotation_angle_diff_deg(
     y1: float, p1: float, r1: float, y2: float, p2: float, r2: float
 ) -> float:
@@ -54,7 +75,7 @@ def order_frames_with_horizon_anchor(frames_meta: list[dict[str, Any]]) -> list[
     """
     Переупорядочивает список кадров так, чтобы первым (index 0) шел наиболее стабильный
     опорный снимок около горизонта (предпочтительно ряд -26°..+10°) с минимальным
-    рассогласованием курса подвеса/корпуса и минимальным креном дрона от ветра.
+    рассогласованием курса подвеса/корпуса, минимальным креном дрона от ветра и минимальной линейной скоростью.
     При этом Север (Yaw = 0°) всегда остается строго в центре панорамы (X = 7500).
     """
     if not frames_meta:
@@ -67,11 +88,12 @@ def order_frames_with_horizon_anchor(frames_meta: list[dict[str, Any]]) -> list[
         fl_yaw = _wrap_yaw(float(f.get("flight_yaw", yaw)))
         fl_pitch = float(f.get("flight_pitch", 0.0))
         fl_roll = float(f.get("flight_roll", 0.0))
+        speed = float(f.get("linear_speed", 0.0))
         yaw_lag = abs(_wrap_angle_diff(yaw, fl_yaw))
         body_tilt = math.hypot(fl_pitch, fl_roll)
         # Предпочитаем кадры у горизонта (-28° <= pitch <= +10°) с минимальным доворотом подвеса
         pitch_penalty = abs(pitch + 15.0) if -28.0 <= pitch <= 10.0 else abs(pitch) + 40.0
-        stability_penalty = pitch_penalty + 6.0 * yaw_lag + 1.5 * body_tilt
+        stability_penalty = pitch_penalty + 6.0 * yaw_lag + 1.5 * body_tilt + 0.5 * speed
         return (stability_penalty, abs(yaw), idx)
 
     best_idx, _ = min(enumerate(frames_meta), key=anchor_score)
@@ -229,7 +251,6 @@ def filter_sky_control_points(
                                 pitch_deg=pitch,
                                 roll_deg=float(fm["gimbal_roll"]),
                             )
-                            # Пиксели выше горизонта имеют y_pt < y_hor
                             if y_pt < (y_hor + horizon_margin_px):
                                 is_sky = True
                                 break
@@ -442,3 +463,115 @@ def clamp_photometric_pto(
 
     with open(output_pto_path, "w", encoding="utf-8", newline="\n") as f:
         f.writelines(lines)
+
+
+def compute_pto_cp_rms(pto_path: str, pano_width: int = 15000) -> dict[str, Any]:
+    """
+    Вычисляет среднеквадратичную (RMS) и 95-перцентильную (p95) угловую ошибку
+    контрольных точек в пикселях итоговой панорамы (15000x7500) для диагностики качества сшивки.
+    """
+    with open(pto_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    img_params: list[dict[str, float]] = []
+    v0 = 71.5
+    a0 = 0.0
+    b0 = 0.0
+    c0 = 0.0
+    d0 = 0.0
+    e0 = 0.0
+
+    for line in lines:
+        if line.startswith("i "):
+            w = _parse_pto_param(line, "w") or 5280.0
+            h = _parse_pto_param(line, "h") or 3956.0
+            v = _parse_pto_param(line, "v")
+            a = _parse_pto_param(line, "a")
+            b = _parse_pto_param(line, "b")
+            c = _parse_pto_param(line, "c")
+            d = _parse_pto_param(line, "d")
+            e = _parse_pto_param(line, "e")
+            if not img_params:
+                if v is not None and v > 1.0:
+                    v0 = v
+                if a is not None:
+                    a0 = a
+                if b is not None:
+                    b0 = b
+                if c is not None:
+                    c0 = c
+                if d is not None:
+                    d0 = d
+                if e is not None:
+                    e0 = e
+            img_params.append(
+                {
+                    "w": w,
+                    "h": h,
+                    "v": v if (v is not None and v > 1.0) else v0,
+                    "a": a if a is not None else a0,
+                    "b": b if b is not None else b0,
+                    "c": c if c is not None else c0,
+                    "d": d if d is not None else d0,
+                    "e": e if e is not None else e0,
+                    "y": _parse_pto_param(line, "y") or 0.0,
+                    "p": _parse_pto_param(line, "p") or 0.0,
+                    "r": _parse_pto_param(line, "r") or 0.0,
+                }
+            )
+
+    def _pixel_to_ray(img_idx: int, xp: float, yp: float) -> np.ndarray:
+        p = img_params[img_idx]
+        f_px = (p["w"] * 0.5) / math.tan(math.radians(p["v"] * 0.5))
+        dx = xp - p["w"] * 0.5 - p["d"]
+        dy = yp - p["h"] * 0.5 - p["e"]
+        r_scale = min(p["w"], p["h"]) * 0.5
+        r_src = math.hypot(dx, dy) / r_scale
+        if r_src > 1e-7:
+            d_param = 1.0 - p["a"] - p["b"] - p["c"]
+            rd = r_src
+            for _ in range(6):
+                f_val = (((p["a"] * rd + p["b"]) * rd + p["c"]) * rd + d_param) * rd - r_src
+                df_val = (4.0 * p["a"] * rd + 3.0 * p["b"]) * rd * rd + 2.0 * p["c"] * rd + d_param
+                if abs(df_val) < 1e-6:
+                    break
+                rd -= f_val / df_val
+            if rd > 0.0:
+                scale = rd / r_src
+                dx *= scale
+                dy *= scale
+        vx = dx / f_px
+        vy = -dy / f_px
+        vec = np.array([vx, vy, 1.0], dtype=np.float64)
+        vec /= np.linalg.norm(vec)
+        rot = _euler_to_rotation_matrix(p["y"], -p["p"], -p["r"])
+        return rot @ vec
+
+    cp_pattern = re.compile(
+        r"^c\s+n(\d+)\s+N(\d+)\s+x([0-9.\-+eE]+)\s+y([0-9.\-+eE]+)\s+X([0-9.\-+eE]+)\s+Y([0-9.\-+eE]+)"
+    )
+    errors_px: list[float] = []
+    px_per_deg = float(pano_width) / 360.0
+
+    for line in lines:
+        if line.startswith("c "):
+            m = cp_pattern.match(line.strip())
+            if m:
+                n1, n2 = int(m.group(1)), int(m.group(2))
+                if 0 <= n1 < len(img_params) and 0 <= n2 < len(img_params):
+                    r1 = _pixel_to_ray(n1, float(m.group(3)), float(m.group(4)))
+                    r2 = _pixel_to_ray(n2, float(m.group(5)), float(m.group(6)))
+                    dot = max(-1.0, min(1.0, float(np.dot(r1, r2))))
+                    ang_deg = math.degrees(math.acos(dot))
+                    errors_px.append(ang_deg * px_per_deg)
+
+    if not errors_px:
+        return {"count": 0, "rms_px": 0.0, "p95_px": 0.0, "max_px": 0.0}
+
+    arr = np.array(errors_px, dtype=np.float64)
+    return {
+        "count": len(errors_px),
+        "rms_px": round(float(np.sqrt(np.mean(arr**2))), 2),
+        "p95_px": round(float(np.percentile(arr, 95)), 2),
+        "max_px": round(float(np.max(arr)), 2),
+    }

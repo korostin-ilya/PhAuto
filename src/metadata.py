@@ -102,6 +102,7 @@ def extract_frame_metadata(image_path: str, default_hfov: float = 73.7) -> dict[
         "make": "DJI",
         "model": "Unknown",
         "datetime_str": None,
+        "datetime_iso_aware": None,
         "exposure_time": 0.001,
         "f_number": 2.8,
         "iso": 100.0,
@@ -117,15 +118,28 @@ def extract_frame_metadata(image_path: str, default_hfov: float = 73.7) -> dict[
         "flight_yaw": 0.0,
         "flight_pitch": 0.0,
         "flight_roll": 0.0,
+        "flight_x_speed": 0.0,
+        "flight_y_speed": 0.0,
+        "flight_z_speed": 0.0,
+        "linear_speed": 0.0,
+        "rtk_flag": 0,
+        "rtk_std_lon": None,
+        "rtk_std_lat": None,
+        "rtk_std_hgt": None,
         "relative_altitude": 35.0,
         "absolute_altitude": 0.0,
         "altitude_type": None,
         "calibrated_focal_length": None,
+        "calibrated_optical_center_x": None,
+        "calibrated_optical_center_y": None,
+        "d0": 0.0,
+        "e0": 0.0,
         "dewarp_data": None,
         "hfov": default_hfov,
         "xmp": {},
     }
 
+    exif_offset_time: str | None = None
     with Image.open(image_path) as img:
         meta["width"], meta["height"] = img.size
         exif = img.getexif()
@@ -163,6 +177,8 @@ def extract_frame_metadata(image_path: str, default_hfov: float = 73.7) -> dict[
                         meta["focal_length_35mm"] = f35
                 elif tag_name == "DateTimeOriginal":
                     meta["datetime_str"] = str(value).strip("\x00 ")
+                elif tag_name in ("OffsetTimeOriginal", "OffsetTime") and not exif_offset_time:
+                    exif_offset_time = str(value).strip("\x00 ")
 
             # Вложенный каталог GPSInfo (0x8825)
             try:
@@ -185,6 +201,19 @@ def extract_frame_metadata(image_path: str, default_hfov: float = 73.7) -> dict[
 
     xmp = _extract_xmp_dict(image_path)
     meta["xmp"] = xmp
+
+    # Извлекаем ISO-время со смещением часового пояса пульта (например, xmp:CreateDate="2026-10-28T00:23:23+08:00"),
+    # чтобы корректно переводить время съемки в UTC даже если пульт дрона был настроен на чужой часовой пояс (+08:00 / -07:00)
+    xmp_dt_str = xmp.get("xmp:CreateDate") or xmp.get("xmp:ModifyDate") or xmp.get("photoshop:DateCreated")
+    if xmp_dt_str:
+        meta["datetime_iso_aware"] = str(xmp_dt_str).strip()
+    elif meta["datetime_str"] and exif_offset_time:
+        try:
+            date_part = meta["datetime_str"][:10].replace(":", "-")
+            time_part = meta["datetime_str"][11:19]
+            meta["datetime_iso_aware"] = f"{date_part}T{time_part}{exif_offset_time}"
+        except Exception:
+            pass
 
     has_gimbal_xmp = (
         "drone-dji:GimbalYawDegree" in xmp and "drone-dji:GimbalPitchDegree" in xmp
@@ -220,6 +249,25 @@ def extract_frame_metadata(image_path: str, default_hfov: float = 73.7) -> dict[
     if "drone-dji:FlightRollDegree" in xmp:
         meta["flight_roll"] = _to_float(xmp["drone-dji:FlightRollDegree"], 0.0)
 
+    if "drone-dji:FlightXSpeed" in xmp:
+        meta["flight_x_speed"] = _to_float(xmp["drone-dji:FlightXSpeed"], 0.0)
+    if "drone-dji:FlightYSpeed" in xmp:
+        meta["flight_y_speed"] = _to_float(xmp["drone-dji:FlightYSpeed"], 0.0)
+    if "drone-dji:FlightZSpeed" in xmp:
+        meta["flight_z_speed"] = _to_float(xmp["drone-dji:FlightZSpeed"], 0.0)
+    meta["linear_speed"] = math.sqrt(
+        meta["flight_x_speed"] ** 2 + meta["flight_y_speed"] ** 2 + meta["flight_z_speed"] ** 2
+    )
+
+    if "drone-dji:RtkFlag" in xmp:
+        meta["rtk_flag"] = int(_to_float(xmp["drone-dji:RtkFlag"], 0))
+    if "drone-dji:RtkStdLon" in xmp:
+        meta["rtk_std_lon"] = _to_float(xmp["drone-dji:RtkStdLon"], None)
+    if "drone-dji:RtkStdLat" in xmp:
+        meta["rtk_std_lat"] = _to_float(xmp["drone-dji:RtkStdLat"], None)
+    if "drone-dji:RtkStdHgt" in xmp:
+        meta["rtk_std_hgt"] = _to_float(xmp["drone-dji:RtkStdHgt"], None)
+
     if "drone-dji:RelativeAltitude" in xmp:
         meta["relative_altitude"] = _to_float(xmp["drone-dji:RelativeAltitude"], 35.0)
     if "drone-dji:AbsoluteAltitude" in xmp:
@@ -228,13 +276,38 @@ def extract_frame_metadata(image_path: str, default_hfov: float = 73.7) -> dict[
         meta["altitude_type"] = xmp["drone-dji:AltitudeType"]
     if "drone-dji:CalibratedFocalLength" in xmp:
         meta["calibrated_focal_length"] = _to_float(xmp["drone-dji:CalibratedFocalLength"], None)
+    if "drone-dji:CalibratedOpticalCenterX" in xmp:
+        meta["calibrated_optical_center_x"] = _to_float(
+            xmp["drone-dji:CalibratedOpticalCenterX"], None
+        )
+    if "drone-dji:CalibratedOpticalCenterY" in xmp:
+        meta["calibrated_optical_center_y"] = _to_float(
+            xmp["drone-dji:CalibratedOpticalCenterY"], None
+        )
     if "drone-dji:DewarpData" in xmp:
         meta["dewarp_data"] = xmp["drone-dji:DewarpData"]
 
-    if meta["gps_lat"] is None and "drone-dji:GpsLatitude" in xmp:
-        meta["gps_lat"] = _to_float(xmp["drone-dji:GpsLatitude"], None)
-    if meta["gps_lon"] is None and "drone-dji:GpsLongitude" in xmp:
-        meta["gps_lon"] = _to_float(xmp["drone-dji:GpsLongitude"], None)
+    # Смещение оптического центра (d0, e0) из заводской калибровки DJI
+    oc_x = meta["calibrated_optical_center_x"]
+    oc_y = meta["calibrated_optical_center_y"]
+    if oc_x is not None and oc_y is not None and oc_x > 100.0 and oc_y > 100.0:
+        d0_val = float(oc_x) - (float(meta["width"]) / 2.0)
+        e0_val = float(oc_y) - (float(meta["height"]) / 2.0)
+        if abs(d0_val) <= 250.0 and abs(e0_val) <= 250.0:
+            meta["d0"] = d0_val
+            meta["e0"] = e0_val
+
+    # XMP-координаты RTK имеют точность 9 знаков после запятой (против квантованных секунд в EXIF DMS),
+    # а на старых прошивках DJI FC6310S встречается тег с опечаткой drone-dji:GpsLongtitude
+    xmp_lat = _to_float(xmp.get("drone-dji:GpsLatitude"), None)
+    xmp_lon = _to_float(
+        xmp.get("drone-dji:GpsLongitude", xmp.get("drone-dji:GpsLongtitude")),
+        None,
+    )
+    if xmp_lat is not None and abs(xmp_lat) > 1e-5:
+        meta["gps_lat"] = xmp_lat
+    if xmp_lon is not None and abs(xmp_lon) > 1e-5:
+        meta["gps_lon"] = xmp_lon
     if meta["gps_alt"] is None and meta["absolute_altitude"]:
         meta["gps_alt"] = meta["absolute_altitude"]
 
@@ -342,8 +415,6 @@ def filter_series_frames(
                 stage2_candidates.append(f)
 
     # Ступень 3: Удаление побайтовых и угловых дубликатов
-    # Чтобы не читать полные 10-15 МБ файлы по сети/монтированию Docker ради SHA-256,
-    # вычисляем хеш ТОЛЬКО тогда, когда у двух файлов в папке абсолютно одинаковый размер в байтах.
     kept_frames: list[dict[str, Any]] = []
     size_to_paths: dict[int, list[str]] = {}
     size_to_hashes: dict[int, set[str]] = {}
@@ -359,7 +430,6 @@ def filter_series_frames(
                 fsize = -1
             if fsize > 0:
                 if fsize in size_to_paths:
-                    # Вычисляем SHA-256 первого файла такого размера лениво при первой коллизии размера
                     if fsize not in size_to_hashes:
                         first_hash = _file_sha256(size_to_paths[fsize][0])
                         size_to_hashes[fsize] = {first_hash} if first_hash else set()
@@ -513,6 +583,8 @@ def compute_sun_position(
     """
     Вычисляет часовой пояс точки съемки, UTC-время, астрономический азимут и высоту солнца,
     пиксельные координаты (X_sun_pano, Y_sun_pano) и индикатор пасмурной погоды по разбросу EV100.
+    Корректно учитывает смещение часового пояса в XMP (xmp:CreateDate), когда пульт БПЛА
+    настроен на другой часовой пояс (например, +08:00 или -07:00).
     """
     ref = next(
         (f for f in frames_meta if f.get("gps_lat") is not None and f.get("gps_lon") is not None),
@@ -522,6 +594,7 @@ def compute_sun_position(
     lon = ref.get("gps_lon")
     alt = ref.get("gps_alt") or 0.0
     dt_str = ref.get("datetime_str")
+    dt_iso_aware = ref.get("datetime_iso_aware") or (ref.get("xmp") or {}).get("xmp:CreateDate")
 
     tz_name = "UTC"
     if lat is not None and lon is not None:
@@ -530,22 +603,47 @@ def compute_sun_position(
             tz_name = found_tz
 
     local_tz = ZoneInfo(tz_name)
+    dt_naive_local: datetime | None = None
     if dt_str:
         try:
             dt_naive = datetime.strptime(dt_str[:19], "%Y:%m:%d %H:%M:%S")
         except ValueError:
             dt_naive = datetime.fromisoformat(dt_str[:19])
-        dt_local = dt_naive.replace(tzinfo=local_tz)
-    else:
-        dt_local = datetime.now(tz=local_tz)
+        dt_naive_local = dt_naive.replace(tzinfo=local_tz)
 
-    dt_utc = dt_local.astimezone(timezone.utc)
+    dt_from_iso_local: datetime | None = None
+    if dt_iso_aware:
+        try:
+            parsed_iso = datetime.fromisoformat(str(dt_iso_aware).strip())
+            if parsed_iso.tzinfo is not None:
+                dt_from_iso_local = parsed_iso.astimezone(local_tz)
+        except Exception:
+            dt_from_iso_local = None
 
     if lat is not None and lon is not None:
         observer = Observer(latitude=float(lat), longitude=float(lon), elevation=max(float(alt), 0.0))
+        if dt_from_iso_local is not None and dt_naive_local is not None:
+            el_iso = float(sun_elevation(observer, dateandtime=dt_from_iso_local.astimezone(timezone.utc)))
+            el_naive = float(sun_elevation(observer, dateandtime=dt_naive_local.astimezone(timezone.utc)))
+            # Если при точном учете часового пояса из XMP солнце над горизонтом (или выше, чем при наивном времени),
+            # используем точный перевод из часового пояса пульта (исправляет пульты с +08:00 / -07:00)
+            if el_iso >= 0.0 or el_iso >= el_naive:
+                dt_local = dt_from_iso_local
+            else:
+                dt_local = dt_naive_local
+        elif dt_from_iso_local is not None:
+            dt_local = dt_from_iso_local
+        elif dt_naive_local is not None:
+            dt_local = dt_naive_local
+        else:
+            dt_local = datetime.now(tz=local_tz)
+
+        dt_utc = dt_local.astimezone(timezone.utc)
         az_deg = float(sun_azimuth(observer, dateandtime=dt_utc)) % 360.0
         el_deg = float(sun_elevation(observer, dateandtime=dt_utc))
     else:
+        dt_local = dt_from_iso_local or dt_naive_local or datetime.now(tz=local_tz)
+        dt_utc = dt_local.astimezone(timezone.utc)
         az_deg = 180.0
         el_deg = 45.0
 
@@ -623,13 +721,12 @@ def _inject_xmp_into_jpeg_file(jpeg_path: str, xmp_packet: bytes) -> None:
     seg_len = len(payload) + 2
     app1_xmp = b"\xff\xe1" + seg_len.to_bytes(2, "big") + payload
 
-    # Удаляем старый XMP-сегмент, если он был, и вставляем новый сразу после SOI / первого APP0/APP1
     pos = 2
     insert_pos = 2
     cleaned_chunks = [data[:2]]
     while pos + 4 <= len(data) and data[pos] == 0xFF:
         marker = data[pos + 1]
-        if marker in (0xDA, 0xD9):  # SOS или EOI
+        if marker in (0xDA, 0xD9):
             break
         if marker in (0xD8, 0x01) or (0xD0 <= marker <= 0xD7):
             cleaned_chunks.append(data[pos : pos + 2])
@@ -639,7 +736,6 @@ def _inject_xmp_into_jpeg_file(jpeg_path: str, xmp_packet: bytes) -> None:
         seg_end = pos + 2 + length
         seg_bytes = data[pos:seg_end]
         if marker == 0xE1 and data[pos + 4 : pos + 4 + len(xmp_header)] == xmp_header:
-            # Пропускаем существующий XMP-пакет
             pos = seg_end
             continue
         cleaned_chunks.append(seg_bytes)
@@ -662,15 +758,14 @@ def get_reference_exif_bytes(reference_jpg_path: str, full_width: int = 15000, f
             exif = ref_img.getexif()
             if not exif:
                 return None
-            # Обновляем размеры и ориентацию для сшитой панорамы
-            exif[0x0112] = 1  # Orientation = Normal (1)
+            exif[0x0112] = 1
             exif[0x0100] = full_width
             exif[0x0101] = full_height
             try:
                 exif_ifd = exif.get_ifd(0x8769)
                 if exif_ifd is not None:
-                    exif_ifd[0xA002] = full_width  # ExifImageWidth
-                    exif_ifd[0xA003] = full_height  # ExifImageHeight
+                    exif_ifd[0xA002] = full_width
+                    exif_ifd[0xA003] = full_height
             except Exception:
                 pass
             return exif.tobytes()
@@ -688,7 +783,6 @@ def write_output_metadata(
     """
     Переносит геолокацию (GPSInfo), дату съемки и модель камеры из опорного снимка
     и вшивает XMP-теги Google Photo Sphere (GPano).
-    Использует ExifTool при наличии в системе, а также нативный инжектор APP1 XMP.
     """
     xmp_packet = build_gpano_xmp_packet(
         full_width=full_width,
@@ -725,5 +819,4 @@ def write_output_metadata(
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except Exception:
-            # Встроенный инжектор уже записал GPano XMP и EXIF от Pillow
             pass

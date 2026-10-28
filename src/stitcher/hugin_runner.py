@@ -16,6 +16,7 @@ import numpy as np
 
 from src.stitcher.pto_generator import (
     clamp_photometric_pto,
+    compute_pto_cp_rms,
     enforce_angle_sanity_check,
     filter_sky_control_points,
     generate_initial_pto,
@@ -244,10 +245,10 @@ def run_stitching_pipeline(
     """
     Выполняет полный цикл Модуля 1 (Сборка панорамы):
     1.1 Динамический расчет HFOV и генерация initial.pto с опорным кадром у горизонта.
-    1.2 Поиск контрольных точек cpfind --prealigned --fullscale.
-    1.3 Удаление точек неба выше линии горизонта + фильтрация параллакса cpclean -n 1.5.
-    1.4 Оптимизация геометрии autooptimiser + Sanity Check (>3.5° -> откат к RTK).
-    1.5 Фотометрическая коррекция vig_optimize + репроекция nona + сшивка multiblend.
+    1.2 Поиск контрольных точек cpfind --prealigned.
+    1.3 Удаление точек неба выше линии горизонта + двухэтапная оптимизация autooptimiser и cpclean.
+    1.4 Sanity Check 3D-углов поворота.
+    1.5 Фотометрическая коррекция (опционально) + репроекция nona + сшивка multiblend.
     Возвращает (pano_bgr, alpha_mask, ordered_frames_meta, stitch_stats).
     """
     pano_cfg = config.get("panorama", {})
@@ -397,6 +398,8 @@ def run_stitching_pipeline(
                 max_deviation_deg=max_angle_dev,
             )
 
+        cp_rms_stats = compute_pto_cp_rms(opt_checked_pto, pano_width=pano_width)
+
         # Шаг 1.5.1: Фотометрическая коррекция (vig_optimize — опционально, т.к. multiblend --wideblend сам выравнивает тон)
         photo_vars_pto = os.path.join(work_dir, "photo_vars.pto")
         final_raw_pto = os.path.join(work_dir, "final_raw.pto")
@@ -505,6 +508,7 @@ def run_stitching_pipeline(
             "hfov_initial": ordered_frames[0]["hfov"],
             "sky_cp_stats": sky_cp_stats,
             "sanity_check": sanity_stats,
+            "cp_rms": cp_rms_stats,
             "num_tiles": len(tile_names),
             "timings": {
                 "cpfind": round(t_cpfind, 1),

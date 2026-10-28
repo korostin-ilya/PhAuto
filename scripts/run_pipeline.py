@@ -145,7 +145,7 @@ def process_single_series(
     # 2. Модуль 1: Сборка панорамы (Hugin CLI + Multiblend) ИЛИ загрузка готовой панорамы без неба
     t_stitch = time.time()
     if mode == "stitch":
-        print("[Модуль 1]      Запуск сшивки панорамы (cpfind -> cpclean -> autooptimiser -> vig_optimize -> nona -> multiblend)...")
+        print("[Модуль 1]      Запуск сшивки панорамы (cpfind -> cpclean -> autooptimiser -> nona -> multiblend)...")
         pano_bgr, alpha_mask, ordered_frames, stitch_stats = run_stitching_pipeline(
             frames_meta=frames_meta,
             config=config,
@@ -158,10 +158,16 @@ def process_single_series(
             if tm
             else ""
         )
+        cp_rms = stitch_stats.get("cp_rms", {})
+        rms_str = (
+            f" | Ошибка точек: RMS={cp_rms.get('rms_px', 0.0):.2f}px (p95={cp_rms.get('p95_px', 0.0):.2f}px)"
+            if cp_rms
+            else ""
+        )
         print(
             f"[Модуль 1]      Сшивка завершена за {time.time() - t_stitch:.1f}s{tm_str} | "
             f"Опорный кадр: {stitch_stats['anchor_frame']} (pitch={stitch_stats['anchor_pitch']}°, yaw={stitch_stats['anchor_yaw']}°) | "
-            f"Точки: всего={stitch_stats['sky_cp_stats']['total_cps']}, удалено на небе={stitch_stats['sky_cp_stats']['removed_sky_cps']} | "
+            f"Точки: всего={stitch_stats['sky_cp_stats']['total_cps']}, удалено на небе={stitch_stats['sky_cp_stats']['removed_sky_cps']}{rms_str} | "
             f"Sanity reset кадров: {len(stitch_stats['sanity_check']['reset_frames'])}"
         )
     else:
@@ -207,6 +213,8 @@ def process_single_series(
         selected_sky_path=winner["full_path"],
         x_sun_pano=sun_info["x_sun_pano"],
         config=config,
+        y_sun_pano=sun_info["y_sun_pano_clamped"],
+        template_sun_y=winner.get("sun_y"),
     )
     print(
         f"[Модуль 2.4]    Блендинг и защита объектов выполнены за {time.time() - t_blend:.2f}s | "
@@ -320,6 +328,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--overwrite",
+        "--force",
+        "-f",
+        dest="overwrite",
         action="store_true",
         help="Перезаписывать уже существующие итоговые панорамы (<папка>_full.jpeg)",
     )
