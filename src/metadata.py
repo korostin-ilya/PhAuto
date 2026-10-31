@@ -367,61 +367,250 @@ def _file_sha256(path: str) -> str | None:
         return None
 
 
-def filter_series_frames(
-    frames: list[dict[str, Any]],
+def _parse_frame_timestamp_sec(frame: dict[str, Any]) -> float | None:
+    """Извлекает монотонную временную метку кадра (в секундах) из XMP/EXIF для хронологической сортировки."""
+    dt_iso = frame.get("datetime_iso_aware") or (frame.get("xmp") or {}).get("xmp:CreateDate")
+    if dt_iso:
+        try:
+            return datetime.fromisoformat(str(dt_iso).strip()).timestamp()
+        except Exception:
+            pass
+    dt_str = frame.get("datetime_str")
+    if dt_str:
+        s = str(dt_str).strip()[:19]
+        for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+    return None
+
+
+def _extract_filename_series_key(filename: str) -> tuple[str, int | None, str]:
+    """
+    Выделяет из имени файла:
+    - norm_prefix: нормализованный префикс серии (например, 'pano(1)', 'pano(2)', 'dji_<ts>_')
+    - frame_num: порядковый номер кадра внутри серии (1..25)
+    - display_label: читаемая метка серии (например, 'Pano(1)')
+    """
+    stem = os.path.splitext(os.path.basename(filename))[0].strip()
+    m = re.match(r"^(.*?)(\d+)(?:[_\-][A-Za-z])?$", stem)
+    if not m:
+        return stem.lower(), None, stem
+    raw_prefix = m.group(1).strip()
+    frame_num = int(m.group(2))
+    # Нормализуем 14-значные метки времени в именах вида DJI_20261029071958_0001_D.JPG,
+    # чтобы посекундное изменение имени не дробило одну серию на отдельные префиксы
+    norm_prefix = re.sub(r"20\d{12}", "<ts>", raw_prefix.lower()).strip("_- ")
+    display_label = raw_prefix.rstrip("_- ") or stem
+    return norm_prefix, frame_num, display_label
+
+
+def _gps_horizontal_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Вычисляет горизонтальное расстояние (в метрах) между двумя точками GPS/RTK."""
+    dy = (lat2 - lat1) * 111320.0
+    mean_lat_rad = math.radians((lat1 + lat2) * 0.5)
+    dx = (lon2 - lon1) * 111320.0 * math.cos(mean_lat_rad)
+    return math.hypot(dx, dy)
+
+
+def _azimuth_octants_covered(frames_subset: list[dict[str, Any]]) -> set[int]:
+    """Возвращает множество покрытых 45-градусных азимутальных секторов (0..7) для ненадирных кадров."""
+    octants: set[int] = set()
+    for f in frames_subset:
+        if float(f.get("gimbal_pitch", 0.0)) > -75.0:
+            yaw = float(f.get("gimbal_yaw", 0.0))
+            oct_idx = int(((yaw + 180.0) % 360.0) // 45.0) % 8
+            octants.add(oct_idx)
+    return octants
+
+
+def _has_nadir_frame(frames_subset: list[dict[str, Any]]) -> bool:
+    return any(float(f.get("gimbal_pitch", 0.0)) <= -82.0 for f in frames_subset)
+
+
+def _is_complete_sphere_series(frames_subset: list[dict[str, Any]]) -> bool:
+    """
+    Проверяет, образует ли набор кадров полный сферический обход панорамы:
+    - покрыто >= 7 из 8 азимутальных секторов (360° по горизонтали),
+    - присутствуют кадры верхнего/горизонтального пояса (pitch > -30°),
+    - присутствуют кадры нижнего наклонного пояса (-75° < pitch <= -35°),
+    - присутствует кадр надира (pitch <= -82°).
+    """
+    if len(frames_subset) < 20:
+        return False
+    if len(_azimuth_octants_covered(frames_subset)) < 7:
+        return False
+    if not _has_nadir_frame(frames_subset):
+        return False
+    has_upper = any(float(f.get("gimbal_pitch", 0.0)) > -30.0 for f in frames_subset)
+    has_lower_oblique = any(-75.0 < float(f.get("gimbal_pitch", 0.0)) <= -35.0 for f in frames_subset)
+    return has_upper and has_lower_oblique
+
+
+def split_raw_frames_into_series(
+    stage2_candidates: list[dict[str, Any]],
     filter_cfg: dict[str, Any] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> list[list[dict[str, Any]]]:
     """
-    Трехступенчатая фильтрация входных снимков для сборки панорамы:
-    1. Отсечение уже собранных панорам (GPano:*, соотношение 2:1, ширина >= 10000, *_full.jpg).
-    2. Проверка наличия XMP-телеметрии подвеса (drone-dji:Gimbal*) и единого разрешения сенсора.
-    3. Удаление побайтовых (SHA-256) и угловых дубликатов на сфере (d_theta < duplicate_angle_threshold_deg).
-    Возвращает (kept_raw_frames, filter_report).
+    Разделяет список валидных сырых кадров из одной папки на отдельные серии панорамной съемки
+    по 4 независимым признакам:
+    1. Явный префикс серии в имени файла (например, Pano(1)1..25 и Pano(2)1..25), если в каждой группе >= min_raw_frames.
+    2. Разрыв по времени съемки (xmp:CreateDate / DateTimeOriginal) > series_time_gap_sec (по умолчанию 15 с).
+    3. Пространственный скачок точки зависания RTK/GPS > series_gps_distance_m (по умолчанию 10 м) или высоты > 8 м.
+    4. Завершение полного 360° цикла обхода подвеса (8 азимутальных секторов + надир) с началом нового цикла.
     """
+    if not stage2_candidates:
+        return []
+
     cfg = filter_cfg or {}
-    exclude_panos = bool(cfg.get("exclude_stitched_panoramas", True))
-    require_gimbal = bool(cfg.get("require_gimbal_xmp", True))
-    dup_angle_thresh = float(cfg.get("duplicate_angle_threshold_deg", 3.0))
+    min_raw = max(2, int(cfg.get("min_raw_frames", 5)))
+    time_gap_thresh = float(cfg.get("series_time_gap_sec", 15.0))
+    gps_dist_thresh = float(cfg.get("series_gps_distance_m", 10.0))
+    alt_diff_thresh = float(cfg.get("series_altitude_diff_m", 8.0))
 
-    stitched_panoramas: list[dict[str, Any]] = []
-    rejected_no_gimbal: list[str] = []
-    rejected_resolution: list[str] = []
-    rejected_duplicates: list[str] = []
+    enriched: list[tuple[int, str, int, float | None, dict[str, Any]]] = []
+    prefix_counts: Counter[str] = Counter()
+    for orig_idx, f in enumerate(stage2_candidates):
+        norm_pref, f_num, _label = _extract_filename_series_key(f.get("filename", ""))
+        ts = _parse_frame_timestamp_sec(f)
+        prefix_counts[norm_pref] += 1
+        enriched.append((orig_idx, norm_pref, f_num if f_num is not None else 10**9 + orig_idx, ts, f))
 
-    # Ступень 1: Отсечение уже собранных панорам
-    stage1_candidates: list[dict[str, Any]] = []
-    for f in frames:
-        if exclude_panos and f.get("is_stitched_panorama", False):
-            stitched_panoramas.append(f)
-        else:
-            stage1_candidates.append(f)
-
-    # Ступень 2: Проверка телеметрии подвеса и основного разрешения сенсора
-    stage2_gimbal: list[dict[str, Any]] = []
-    for f in stage1_candidates:
-        if require_gimbal and not f.get("has_gimbal_xmp", True):
-            rejected_no_gimbal.append(f.get("filename", ""))
-        else:
-            stage2_gimbal.append(f)
-
-    stage2_candidates: list[dict[str, Any]] = []
-    if stage2_gimbal:
-        res_counts = Counter((int(f["width"]), int(f["height"])) for f in stage2_gimbal)
-        dominant_res, _ = res_counts.most_common(1)[0]
-        for f in stage2_gimbal:
-            if (int(f["width"]), int(f["height"])) != dominant_res:
-                rejected_resolution.append(f.get("filename", ""))
+    # 1. Группировка по явному префиксу серии (например, 'pano(1)' vs 'pano(2)'),
+    # если обнаружено >= 2 крупных префиксов (по >= min_raw кадров в каждом)
+    major_prefixes = [pref for pref, cnt in prefix_counts.items() if cnt >= min_raw and pref != ""]
+    if len(major_prefixes) >= 2:
+        groups_by_pref: dict[str, list[tuple[int, str, int, float | None, dict[str, Any]]]] = {
+            pref: [] for pref in major_prefixes
+        }
+        minor_items: list[tuple[int, str, int, float | None, dict[str, Any]]] = []
+        for item in enriched:
+            if item[1] in groups_by_pref:
+                groups_by_pref[item[1]].append(item)
             else:
-                stage2_candidates.append(f)
+                minor_items.append(item)
 
-    # Ступень 3: Удаление побайтовых и угловых дубликатов
+        # Одиночные кадры с нестандартным именем прикрепляем к ближайшей по времени основной группе
+        for m_item in minor_items:
+            m_ts = m_item[3]
+            best_pref = major_prefixes[0]
+            best_dist = float("inf")
+            for pref, g_items in groups_by_pref.items():
+                g_ts_list = [x[3] for x in g_items if x[3] is not None]
+                if m_ts is not None and g_ts_list:
+                    d_t = min(abs(m_ts - g_ts) for g_ts in g_ts_list)
+                    if d_t < best_dist:
+                        best_dist = d_t
+                        best_pref = pref
+            groups_by_pref[best_pref].append(m_item)
+
+        def _group_sort_key(pref: str) -> tuple[float, str]:
+            g_ts = [x[3] for x in groups_by_pref[pref] if x[3] is not None]
+            return (min(g_ts) if g_ts else float("inf"), pref)
+
+        initial_groups = [groups_by_pref[p] for p in sorted(major_prefixes, key=_group_sort_key)]
+    else:
+        initial_groups = [enriched]
+
+    # 2. Внутри каждой группы выполняем хронологическую сортировку и деление по времени, GPS и 360°-циклу
+    final_series: list[list[dict[str, Any]]] = []
+
+    for group in initial_groups:
+        has_all_ts = sum(1 for x in group if x[3] is not None) >= max(1, int(0.8 * len(group)))
+        if has_all_ts:
+            sorted_group = sorted(
+                group,
+                key=lambda x: (
+                    x[3] if x[3] is not None else float("inf"),
+                    x[2],
+                    x[4].get("filename", ""),
+                ),
+            )
+        else:
+            sorted_group = sorted(group, key=lambda x: (x[1], x[2], x[4].get("filename", "")))
+
+        cur_items: list[tuple[int, str, int, float | None, dict[str, Any]]] = []
+        total_n = len(sorted_group)
+
+        for idx, item in enumerate(sorted_group):
+            if not cur_items:
+                cur_items.append(item)
+                continue
+
+            rem_count = total_n - idx
+            cur_frames = [x[4] for x in cur_items]
+            should_split = False
+
+            if len(cur_items) >= min_raw and rem_count >= min_raw:
+                prev_ts = cur_items[-1][3]
+                cur_ts = item[3]
+                f_cur = item[4]
+
+                # Критерий А: Временной разрыв между последовательными кадрами > 15 с
+                if prev_ts is not None and cur_ts is not None and (cur_ts - prev_ts) > time_gap_thresh:
+                    should_split = True
+
+                # Критерий Б: Скачок GPS-позиции точки зависания > 10 м или высоты > 8 м
+                if not should_split:
+                    lat_c = f_cur.get("gps_lat")
+                    lon_c = f_cur.get("gps_lon")
+                    cur_lats = sorted(
+                        float(x["gps_lat"]) for x in cur_frames if x.get("gps_lat") is not None
+                    )
+                    cur_lons = sorted(
+                        float(x["gps_lon"]) for x in cur_frames if x.get("gps_lon") is not None
+                    )
+                    if lat_c is not None and lon_c is not None and cur_lats and cur_lons:
+                        med_lat = cur_lats[len(cur_lats) // 2]
+                        med_lon = cur_lons[len(cur_lons) // 2]
+                        dist_m = _gps_horizontal_distance_m(med_lat, med_lon, float(lat_c), float(lon_c))
+                        if dist_m > gps_dist_thresh:
+                            should_split = True
+
+                    cur_alts = sorted(float(x.get("relative_altitude", 35.0)) for x in cur_frames)
+                    med_alt = cur_alts[len(cur_alts) // 2]
+                    if abs(float(f_cur.get("relative_altitude", med_alt)) - med_alt) > alt_diff_thresh:
+                        should_split = True
+
+                # Критерий В: Завершен полный 360°-цикл сферы (>= 24 кадров, все пояса pitch + надир),
+                # а оставшиеся кадры также образуют полноценный сферический обход
+                if not should_split and len(cur_frames) >= 24 and rem_count >= 20:
+                    rem_frames = [x[4] for x in sorted_group[idx:]]
+                    if _is_complete_sphere_series(cur_frames) and _is_complete_sphere_series(rem_frames):
+                        prev_num = cur_items[-1][2]
+                        cur_num = item[2]
+                        if cur_num < prev_num or len(cur_frames) >= 25:
+                            should_split = True
+
+            if should_split:
+                final_series.append([x[4] for x in cur_items])
+                cur_items = [item]
+            else:
+                cur_items.append(item)
+
+        if cur_items:
+            final_series.append([x[4] for x in cur_items])
+
+    return final_series
+
+
+def _deduplicate_single_series(
+    series_frames: list[dict[str, Any]],
+    dup_angle_thresh: float = 3.0,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Удаляет побайтовые (SHA-256) и угловые дубликаты на сфере (d_theta < dup_angle_thresh)
+    внутри одной серии панорамных снимков.
+    """
     kept_frames: list[dict[str, Any]] = []
+    rejected_duplicates: list[str] = []
     size_to_paths: dict[int, list[str]] = {}
     size_to_hashes: dict[int, set[str]] = {}
-    alts = sorted(float(f.get("relative_altitude", 35.0)) for f in stage2_candidates)
+    alts = sorted(float(f.get("relative_altitude", 35.0)) for f in series_frames)
     median_alt = alts[len(alts) // 2] if alts else 35.0
 
-    for f in stage2_candidates:
+    for f in series_frames:
         fpath = f.get("path", "")
         if fpath and os.path.isfile(fpath):
             try:
@@ -472,9 +661,103 @@ def filter_series_frames(
 
         kept_frames.append(f)
 
+    return kept_frames, rejected_duplicates
+
+
+def _summarize_series(series_frames: list[dict[str, Any]], series_idx: int, rejected_dups: list[str]) -> dict[str, Any]:
+    """Формирует краткий паспорт выделенной серии кадров (метка, время, координаты, число кадров)."""
+    if not series_frames:
+        return {"series_index": series_idx, "label": f"series_{series_idx}", "frame_count": 0}
+    _, _, label = _extract_filename_series_key(series_frames[0].get("filename", ""))
+    lats = [float(f["gps_lat"]) for f in series_frames if f.get("gps_lat") is not None]
+    lons = [float(f["gps_lon"]) for f in series_frames if f.get("gps_lon") is not None]
+    return {
+        "series_index": series_idx,
+        "label": label,
+        "frame_count": len(series_frames),
+        "first_frame": series_frames[0].get("filename", ""),
+        "last_frame": series_frames[-1].get("filename", ""),
+        "datetime_start": series_frames[0].get("datetime_iso_aware") or series_frames[0].get("datetime_str"),
+        "datetime_end": series_frames[-1].get("datetime_iso_aware") or series_frames[-1].get("datetime_str"),
+        "gps_lat": round(sum(lats) / len(lats), 7) if lats else None,
+        "gps_lon": round(sum(lons) / len(lons), 7) if lons else None,
+        "rejected_duplicates": rejected_dups,
+    }
+
+
+def filter_series_frames(
+    frames: list[dict[str, Any]],
+    filter_cfg: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Многоступенчатая фильтрация и разделение входных снимков для сборки панорамы:
+    1. Отсечение уже собранных панорам (GPano:*, соотношение 2:1, ширина >= 10000, *_full.jpg).
+    2. Проверка наличия XMP-телеметрии подвеса (drone-dji:Gimbal*) и единого разрешения сенсора.
+    3. Разделение сырых кадров на независимые серии съемки (по префиксу имени, времени, GPS и 360°-циклу)
+       + удаление побайтовых (SHA-256) и угловых дубликатов (d_theta < duplicate_angle_threshold_deg) внутри каждой серии.
+    Возвращает (primary_series_frames, filter_report), а все найденные серии доступны в filter_report["raw_series"].
+    """
+    cfg = filter_cfg or {}
+    exclude_panos = bool(cfg.get("exclude_stitched_panoramas", True))
+    require_gimbal = bool(cfg.get("require_gimbal_xmp", True))
+    dup_angle_thresh = float(cfg.get("duplicate_angle_threshold_deg", 3.0))
+    min_raw = int(cfg.get("min_raw_frames", 5))
+
+    stitched_panoramas: list[dict[str, Any]] = []
+    rejected_no_gimbal: list[str] = []
+    rejected_resolution: list[str] = []
+    rejected_duplicates: list[str] = []
+
+    # Ступень 1: Отсечение уже собранных панорам
+    stage1_candidates: list[dict[str, Any]] = []
+    for f in frames:
+        if exclude_panos and f.get("is_stitched_panorama", False):
+            stitched_panoramas.append(f)
+        else:
+            stage1_candidates.append(f)
+
+    # Ступень 2: Проверка телеметрии подвеса и основного разрешения сенсора
+    stage2_gimbal: list[dict[str, Any]] = []
+    for f in stage1_candidates:
+        if require_gimbal and not f.get("has_gimbal_xmp", True):
+            rejected_no_gimbal.append(f.get("filename", ""))
+        else:
+            stage2_gimbal.append(f)
+
+    stage2_candidates: list[dict[str, Any]] = []
+    if stage2_gimbal:
+        res_counts = Counter((int(f["width"]), int(f["height"])) for f in stage2_gimbal)
+        dominant_res, _ = res_counts.most_common(1)[0]
+        for f in stage2_gimbal:
+            if (int(f["width"]), int(f["height"])) != dominant_res:
+                rejected_resolution.append(f.get("filename", ""))
+            else:
+                stage2_candidates.append(f)
+
+    # Ступень 3: Разделение на независимые серии съемки и удаление дубликатов внутри каждой серии
+    partitioned_series = split_raw_frames_into_series(stage2_candidates, filter_cfg=cfg)
+    raw_series: list[list[dict[str, Any]]] = []
+    series_summaries: list[dict[str, Any]] = []
+
+    for s_frames in partitioned_series:
+        deduped, s_dups = _deduplicate_single_series(s_frames, dup_angle_thresh=dup_angle_thresh)
+        rejected_duplicates.extend(s_dups)
+        if len(deduped) >= min_raw or len(partitioned_series) == 1:
+            s_idx = len(raw_series) + 1
+            raw_series.append(deduped)
+            series_summaries.append(_summarize_series(deduped, s_idx, s_dups))
+        else:
+            rejected_duplicates.extend(f.get("filename", "") for f in deduped)
+
+    kept_frames = raw_series[0] if raw_series else []
+
     report = {
         "total_files": len(frames),
         "kept_raw_count": len(kept_frames),
+        "total_kept_across_series": sum(len(s) for s in raw_series),
+        "num_series": len(raw_series),
+        "raw_series": raw_series,
+        "series_summaries": series_summaries,
         "stitched_panoramas": stitched_panoramas,
         "stitched_panorama_files": [p.get("filename", "") for p in stitched_panoramas],
         "rejected_no_gimbal": rejected_no_gimbal,
@@ -515,6 +798,8 @@ def inspect_shoot_directory(
     """
     Анализирует папку съемки:
     - Если найдено >= min_raw_frames сырых кадров БПЛА -> режим 'stitch' (Модуль 1 + Модуль 2).
+      Если внутри папки обнаружено несколько независимых серий (например, Pano(1)1..25 и Pano(2)1..25),
+      все они возвращаются в списке 'raw_series' для раздельной сборки каждой панорамы.
     - Если сырых кадров нет, но есть готовая сшитая панорама без неба -> режим 'sky_only' (только Модуль 2).
     - Иначе -> режим 'empty'.
     """
@@ -532,9 +817,10 @@ def inspect_shoot_directory(
     ]
     raw_frames, report = filter_series_frames(all_frames, filter_cfg=filter_cfg)
     min_raw = int((filter_cfg or {}).get("min_raw_frames", 5))
+    raw_series = [s for s in report.get("raw_series", []) if len(s) >= min_raw]
     base_pano = select_prestitched_base_panorama(report["stitched_panoramas"])
 
-    if len(raw_frames) >= min_raw:
+    if raw_series:
         mode = "stitch"
     elif base_pano is not None:
         mode = "sky_only"
@@ -543,7 +829,9 @@ def inspect_shoot_directory(
 
     return {
         "mode": mode,
-        "raw_frames": raw_frames,
+        "raw_frames": raw_series[0] if raw_series else raw_frames,
+        "raw_series": raw_series,
+        "series_summaries": report.get("series_summaries", []),
         "prestitched_pano": base_pano,
         "filter_report": report,
     }

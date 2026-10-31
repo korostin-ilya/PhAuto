@@ -14,6 +14,9 @@ stitcher:
     exclude_stitched_panoramas: true
     require_gimbal_xmp: true
     duplicate_angle_threshold_deg: 3.0
+    series_time_gap_sec: 15.0
+    series_gps_distance_m: 10.0
+    series_altitude_diff_m: 8.0
     default_prestitched_zenith_cutoff_y: 2600
   sky_filter_pitch_threshold_deg: -26.0
   sky_horizon_margin_px: 15.0

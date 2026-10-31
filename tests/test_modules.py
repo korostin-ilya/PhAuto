@@ -16,11 +16,16 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from scripts.run_pipeline import default_output_path_for_shoot, discover_shoot_dirs
+from scripts.run_pipeline import (
+    default_output_path_for_shoot,
+    derive_series_output_path,
+    discover_shoot_dirs,
+)
 from src.metadata import (
     compute_sun_position,
     filter_series_frames,
     inspect_shoot_directory,
+    split_raw_frames_into_series,
 )
 from src.sky_replacer.blender import blend_sky_with_panorama
 from src.stitcher.hugin_runner import load_prestitched_panorama_rgba
@@ -44,7 +49,7 @@ def run_all_tests() -> None:
     shoot_dirs = discover_shoot_dirs(pano_root)
     assert len(shoot_dirs) >= 1, f"Expected >= 1 shoot directories in {pano_root}"
 
-    # 1. Тест фильтрации папки с сырыми кадрами
+    # 1. Тест фильтрации папки с сырыми кадрами и разделения нескольких серий
     series_dir = shoot_dirs[0]
     inspected_gl = inspect_shoot_directory(
         series_dir, filter_cfg=config["stitcher"].get("input_filter")
@@ -52,6 +57,44 @@ def run_all_tests() -> None:
     assert inspected_gl["mode"] == "stitch", f"Expected stitch mode, got {inspected_gl['mode']}"
     frames = inspected_gl["raw_frames"]
     assert len(frames) >= 20, f"Expected >= 20 filtered raw frames, got {len(frames)}"
+
+    # Если это папка с двумя сериями (Pano(1)1..25 и Pano(2)1..25), проверяем точное разделение на 2 серии по 25 кадров
+    raw_series = inspected_gl.get("raw_series", [])
+    if inspected_gl["filter_report"]["total_files"] == 50:
+        assert len(raw_series) == 2, f"Expected 2 separated series, got {len(raw_series)}"
+        assert len(raw_series[0]) == 25 and len(raw_series[1]) == 25
+        assert all(f["filename"].startswith("Pano(1)") for f in raw_series[0])
+        assert all(f["filename"].startswith("Pano(2)") for f in raw_series[1])
+
+        # Проверяем, что даже без префикса Pano(1)/Pano(2) (при единой нумерации DJI_0001..DJI_0050)
+        # серии всё равно разделяются на 2 по 25 кадров за счет разрыва по времени (39 с) и скачка GPS (39.4 м)
+        renamed_50: list[dict] = []
+        for idx, f in enumerate(raw_series[0] + raw_series[1], start=1):
+            fc = dict(f)
+            fc["filename"] = f"DJI_{idx:04d}.JPG"
+            renamed_50.append(fc)
+        split_no_prefix = split_raw_frames_into_series(
+            renamed_50, filter_cfg=config["stitcher"].get("input_filter")
+        )
+        assert len(split_no_prefix) == 2 and len(split_no_prefix[0]) == 25 and len(split_no_prefix[1]) == 25
+
+        # Проверяем, что даже при отсутствии разрыва по времени и GPS (пересъемка в одной точке без паузы)
+        # серии разделяются по завершению полного 360°-сферического цикла (Критерий В)
+        same_spot_50: list[dict] = []
+        for idx, f in enumerate(raw_series[0] + raw_series[1], start=1):
+            fc = dict(f)
+            fc["filename"] = f"DJI_{idx:04d}.JPG"
+            fc["datetime_iso_aware"] = None
+            fc["datetime_str"] = None
+            fc["xmp"] = {}
+            fc["gps_lat"] = raw_series[0][0]["gps_lat"]
+            fc["gps_lon"] = raw_series[0][0]["gps_lon"]
+            fc["relative_altitude"] = raw_series[0][0]["relative_altitude"]
+            same_spot_50.append(fc)
+        split_by_cycle = split_raw_frames_into_series(
+            same_spot_50, filter_cfg=config["stitcher"].get("input_filter")
+        )
+        assert len(split_by_cycle) == 2 and len(split_by_cycle[0]) == 25 and len(split_by_cycle[1]) == 25
 
     # 2. Тест 3-ступенчатой фильтрации дубликатов, картинок без XMP и иного разрешения
     synthetic_frames = [dict(f) for f in frames]
@@ -211,8 +254,11 @@ def run_all_tests() -> None:
     assert os.path.normcase(actual_in_folder_out) == os.path.normcase(expected_in_folder_out), (
         f"Expected {expected_in_folder_out}, got {actual_in_folder_out}"
     )
+    second_series_out = derive_series_output_path(actual_in_folder_out, 2, config=config)
+    expected_second_out = os.path.join(series_dir, f"{folder_name}_2_full.jpeg")
+    assert os.path.normcase(second_series_out) == os.path.normcase(expected_second_out)
 
-    print("[TEST PASS] Все тесты метаданных, астрономии, initial.pto, RMS, фильтрации точек неба и Sanity Check прошли успешно!")
+    print("[TEST PASS] Все тесты метаданных, разделения серий, астрономии, initial.pto, RMS, фильтрации точек неба и Sanity Check прошли успешно!")
 
 
 if __name__ == "__main__":

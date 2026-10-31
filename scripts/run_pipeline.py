@@ -63,16 +63,67 @@ def discover_shoot_dirs(root_dir: str) -> list[str]:
     return shoot_dirs
 
 
-def process_single_series(
+def default_output_path_for_shoot(
+    shoot_dir: str,
+    config: dict[str, Any] | None = None,
+    series_index: int = 1,
+) -> str:
+    """
+    Формирует путь к выходному файлу внутри самой папки со снимками:
+    - для первой/единственной серии: <папка>/<папка>_full.jpeg
+    - для дополнительных серий в той же папке: <папка>/<папка>_2_full.jpeg и т.д.
+    """
+    pano_cfg = (config or {}).get("panorama", {})
+    suffix = str(pano_cfg.get("output_suffix", "_full.jpeg"))
+    abs_dir = os.path.abspath(shoot_dir)
+    folder_name = os.path.basename(abs_dir)
+    if folder_name.lower() == "input" and os.environ.get("HOST_FOLDER_NAME"):
+        folder_name = os.environ["HOST_FOLDER_NAME"]
+    if series_index <= 1:
+        return os.path.join(abs_dir, f"{folder_name}{suffix}")
+    return os.path.join(abs_dir, f"{folder_name}_{series_index}{suffix}")
+
+
+def derive_series_output_path(
+    base_output_path: str,
+    series_index: int,
+    config: dict[str, Any] | None = None,
+) -> str:
+    """
+    Формирует путь выходного файла для серии № series_index на основе базового пути:
+    при series_index == 1 возвращает base_output_path без изменений,
+    при series_index >= 2 вставляет индекс перед суффиксом _full.jpeg (или расширением).
+    """
+    if series_index <= 1:
+        return base_output_path
+    pano_cfg = (config or {}).get("panorama", {})
+    suffix = str(pano_cfg.get("output_suffix", "_full.jpeg"))
+    if base_output_path.lower().endswith(suffix.lower()):
+        prefix = base_output_path[: len(base_output_path) - len(suffix)]
+        return f"{prefix}_{series_index}{suffix}"
+    stem, ext = os.path.splitext(base_output_path)
+    if stem.lower().endswith("_full"):
+        return f"{stem[:-5]}_{series_index}_full{ext or '.jpeg'}"
+    return f"{stem}_{series_index}{ext or '.jpeg'}"
+
+
+def _execute_single_series_frames(
     input_dir: str,
     output_jpg_path: str,
+    mode: str,
+    frames_meta: list[dict[str, Any]],
+    prestitched_pano: dict[str, Any] | None,
     sky_dir: str,
     catalog: dict[str, Any],
     config: dict[str, Any],
     work_dir: str | None = None,
     keep_temp: bool = False,
+    series_index: int = 1,
+    total_series: int = 1,
+    series_summary: dict[str, Any] | None = None,
+    t_inspect_sec: float = 0.0,
 ) -> dict[str, Any]:
-    """Обрабатывает одну серию снимков БПЛА (или готовую панораму без неба) до панорамы 15000x7500."""
+    """Внутренний цикл сборки и замены неба для одной конкретной серии кадров."""
     t_total = time.time()
     pano_cfg = config.get("panorama", {})
     stitch_cfg = config.get("stitcher", {})
@@ -84,41 +135,23 @@ def process_single_series(
     horizon_y = int(pano_cfg.get("horizon_y", 3750))
     jpeg_quality = int(pano_cfg.get("jpeg_quality", 96))
     subsampling = int(pano_cfg.get("subsampling", 0))
-    default_hfov = float(stitch_cfg.get("default_hfov", 73.7))
     default_zenith_cutoff_y = int(filter_cfg.get("default_prestitched_zenith_cutoff_y", 2600))
     overcast_ev_thresh = float(match_cfg.get("overcast_ev_spread_threshold", 1.15))
 
+    series_tag = (
+        f" [Серия {series_index}/{total_series}: {series_summary.get('label', f'#{series_index}')}]"
+        if total_series > 1 and series_summary
+        else (f" [Серия {series_index}/{total_series}]" if total_series > 1 else "")
+    )
     print(f"\n{'=' * 78}")
-    print(f"[Пайплайн] Обработка серии: {input_dir}")
+    print(f"[Пайплайн] Обработка серии{series_tag}: {input_dir}")
+    if series_summary and total_series > 1:
+        print(
+            f"[Серия {series_index}/{total_series}]   Кадры: {series_summary.get('first_frame')} .. {series_summary.get('last_frame')} "
+            f"({len(frames_meta)} шт.) | Время: {series_summary.get('datetime_start')} .. {series_summary.get('datetime_end')}"
+        )
     print(f"[Пайплайн] Выходной файл:   {output_jpg_path}")
     print(f"{'=' * 78}")
-
-    # 1. Чтение EXIF/XMP метаданных, фильтрация лишних панорам/дубликатов и расчет солнца
-    t0 = time.time()
-    inspected = inspect_shoot_directory(
-        input_dir=input_dir,
-        default_hfov=default_hfov,
-        filter_cfg=filter_cfg,
-    )
-    mode = inspected["mode"]
-    rep = inspected["filter_report"]
-
-    if mode == "empty":
-        raise ValueError(
-            f"В папке '{input_dir}' не найдено ни сырых кадров БПЛА, ни сшитой панорамы без неба."
-        )
-
-    if rep["stitched_panorama_files"] or rep["rejected_duplicates"] or rep["rejected_no_gimbal"] or rep["rejected_resolution"]:
-        print(
-            f"[Фильтр входа]  Всего JPEG={rep['total_files']} -> Сырых кадров={rep['kept_raw_count']} | "
-            f"Отсечено готовых панорам={len(rep['stitched_panorama_files'])} {rep['stitched_panorama_files']} | "
-            f"Дубликатов={len(rep['rejected_duplicates'])} {rep['rejected_duplicates']}"
-        )
-
-    if mode == "stitch":
-        frames_meta = inspected["raw_frames"]
-    else:
-        frames_meta = [inspected["prestitched_pano"]]
 
     sun_info = compute_sun_position(
         frames_meta=frames_meta,
@@ -130,7 +163,7 @@ def process_single_series(
     lon_val = sun_info["longitude"] if sun_info["longitude"] is not None else 0.0
     print(
         f"[Шаг 1.1 & 2.2] Режим={mode.upper()} | Кадров={len(frames_meta)} | Камера: {frames_meta[0]['make']} {frames_meta[0]['model']} | "
-        f"HFOV={frames_meta[0]['hfov']:.2f}° ({time.time() - t0:.2f}s)"
+        f"HFOV={frames_meta[0]['hfov']:.2f}° ({t_inspect_sec:.2f}s)"
     )
     print(
         f"[Астрономия]    GPS=({lat_val:.5f}, {lon_val:.5f}) | "
@@ -171,9 +204,9 @@ def process_single_series(
             f"Sanity reset кадров: {len(stitch_stats['sanity_check']['reset_frames'])}"
         )
     else:
-        base_pano = inspected["prestitched_pano"]
+        assert prestitched_pano is not None
         pano_bgr, alpha_mask, pre_info = load_prestitched_panorama_rgba(
-            pano_path=base_pano["path"],
+            pano_path=prestitched_pano["path"],
             pano_width=pano_width,
             pano_height=pano_height,
             default_zenith_cutoff_y=default_zenith_cutoff_y,
@@ -245,7 +278,7 @@ def process_single_series(
         full_height=pano_height,
         pose_heading_deg=0.0,
     )
-    total_elapsed = time.time() - t_total
+    total_elapsed = time.time() - t_total + t_inspect_sec
     print(
         f"[Готово]        Панорама сохранена в '{output_jpg_path}' ({pano_width}x{pano_height}, 4:4:4, GPano XMP) "
         f"| Запись={time.time() - t_save:.2f}s | Общее время={total_elapsed:.1f}s"
@@ -254,6 +287,9 @@ def process_single_series(
     return {
         "input_dir": input_dir,
         "output_path": output_jpg_path,
+        "series_index": series_index,
+        "total_series": total_series,
+        "series_summary": series_summary,
         "sun_info": sun_info,
         "stitch_stats": stitch_stats,
         "selected_sky": winner,
@@ -262,18 +298,118 @@ def process_single_series(
     }
 
 
-def default_output_path_for_shoot(shoot_dir: str, config: dict[str, Any] | None = None) -> str:
+def process_single_series(
+    input_dir: str,
+    output_jpg_path: str,
+    sky_dir: str,
+    catalog: dict[str, Any],
+    config: dict[str, Any],
+    work_dir: str | None = None,
+    keep_temp: bool = False,
+    skip_existing: bool = False,
+) -> dict[str, Any]:
     """
-    Формирует путь к выходному файлу внутри самой папки со снимками:
-    <папка>/<папка>_full.jpeg
+    Обрабатывает папку съемки БПЛА (одну или несколько независимых серий кадров внутри папки,
+    либо готовую панораму без неба) до панорам 15000x7500.
     """
-    pano_cfg = (config or {}).get("panorama", {})
-    suffix = str(pano_cfg.get("output_suffix", "_full.jpeg"))
-    abs_dir = os.path.abspath(shoot_dir)
-    folder_name = os.path.basename(abs_dir)
-    if folder_name.lower() == "input" and os.environ.get("HOST_FOLDER_NAME"):
-        folder_name = os.environ["HOST_FOLDER_NAME"]
-    return os.path.join(abs_dir, f"{folder_name}{suffix}")
+    t0 = time.time()
+    stitch_cfg = config.get("stitcher", {})
+    filter_cfg = stitch_cfg.get("input_filter", {})
+    default_hfov = float(stitch_cfg.get("default_hfov", 73.7))
+
+    inspected = inspect_shoot_directory(
+        input_dir=input_dir,
+        default_hfov=default_hfov,
+        filter_cfg=filter_cfg,
+    )
+    t_inspect = time.time() - t0
+    mode = inspected["mode"]
+    rep = inspected["filter_report"]
+
+    if mode == "empty":
+        raise ValueError(
+            f"В папке '{input_dir}' не найдено ни сырых кадров БПЛА, ни сшитой панорамы без неба."
+        )
+
+    num_series = int(rep.get("num_series", 1))
+    if (
+        num_series > 1
+        or rep["stitched_panorama_files"]
+        or rep["rejected_duplicates"]
+        or rep["rejected_no_gimbal"]
+        or rep["rejected_resolution"]
+    ):
+        series_counts = [len(s) for s in inspected.get("raw_series", [])]
+        print(
+            f"\n[Фильтр входа]  Папка: {input_dir} | Всего JPEG={rep['total_files']} -> "
+            f"Найдено серий={num_series} (кадров по сериям: {series_counts}) | "
+            f"Отсечено готовых панорам={len(rep['stitched_panorama_files'])} {rep['stitched_panorama_files']} | "
+            f"Дубликатов внутри серий={len(rep['rejected_duplicates'])} {rep['rejected_duplicates']}"
+        )
+
+    if mode == "stitch":
+        raw_series = inspected["raw_series"]
+        summaries = inspected.get("series_summaries", [])
+        results: list[dict[str, Any]] = []
+
+        for s_idx, s_frames in enumerate(raw_series, start=1):
+            s_out_path = derive_series_output_path(output_jpg_path, s_idx, config=config)
+            if skip_existing and os.path.isfile(s_out_path) and os.path.getsize(s_out_path) > 100_000:
+                print(
+                    f"[Пропуск] Итоговый файл для серии {s_idx}/{ len(raw_series) } уже существует: '{s_out_path}'"
+                )
+                continue
+            s_work_dir = (
+                os.path.join(work_dir, f"series_{s_idx}")
+                if (work_dir and len(raw_series) > 1)
+                else work_dir
+            )
+            s_summary = summaries[s_idx - 1] if s_idx - 1 < len(summaries) else None
+            res = _execute_single_series_frames(
+                input_dir=input_dir,
+                output_jpg_path=s_out_path,
+                mode="stitch",
+                frames_meta=s_frames,
+                prestitched_pano=None,
+                sky_dir=sky_dir,
+                catalog=catalog,
+                config=config,
+                work_dir=s_work_dir,
+                keep_temp=keep_temp,
+                series_index=s_idx,
+                total_series=len(raw_series),
+                series_summary=s_summary,
+                t_inspect_sec=t_inspect if s_idx == 1 else 0.0,
+            )
+            results.append(res)
+
+        if not results:
+            return {"input_dir": input_dir, "skipped": True, "num_series": len(raw_series)}
+        primary = dict(results[0])
+        primary["all_series_results"] = results
+        return primary
+
+    else:
+        if skip_existing and os.path.isfile(output_jpg_path) and os.path.getsize(output_jpg_path) > 100_000:
+            print(f"[Пропуск] Итоговый файл уже существует: '{output_jpg_path}'")
+            return {"input_dir": input_dir, "output_path": output_jpg_path, "skipped": True}
+        base_pano = inspected["prestitched_pano"]
+        return _execute_single_series_frames(
+            input_dir=input_dir,
+            output_jpg_path=output_jpg_path,
+            mode="sky_only",
+            frames_meta=[base_pano],
+            prestitched_pano=base_pano,
+            sky_dir=sky_dir,
+            catalog=catalog,
+            config=config,
+            work_dir=work_dir,
+            keep_temp=keep_temp,
+            series_index=1,
+            total_series=1,
+            series_summary=None,
+            t_inspect_sec=t_inspect,
+        )
 
 
 def main() -> None:
@@ -370,9 +506,6 @@ def main() -> None:
     skip_existing = bool(pano_cfg.get("skip_existing_output", True)) and not args.overwrite
 
     if len(shoot_dirs) == 1 and args.output and args.output.lower().endswith((".jpg", ".jpeg")):
-        if skip_existing and os.path.isfile(args.output) and os.path.getsize(args.output) > 100_000:
-            print(f"[Пропуск] Итоговый файл уже существует: '{args.output}' (используйте --overwrite для пересборки)")
-            return
         process_single_series(
             input_dir=shoot_dirs[0],
             output_jpg_path=args.output,
@@ -381,6 +514,7 @@ def main() -> None:
             config=config,
             work_dir=args.work_dir,
             keep_temp=args.keep_temp,
+            skip_existing=skip_existing,
         )
     else:
         suffix = str(pano_cfg.get("output_suffix", "_full.jpeg"))
@@ -398,14 +532,8 @@ def main() -> None:
             if out_root:
                 out_file = os.path.join(out_root, f"{rel_name}{suffix}")
             else:
-                # Сохраняем прямо в папку со снимками под именем <папка>_full.jpeg
+                # Сохраняем прямо в папку со снимками под именем <папка>_full.jpeg (и <папка>_2_full.jpeg при нескольких сериях)
                 out_file = default_output_path_for_shoot(s_dir, config=config)
-
-            if skip_existing and os.path.isfile(out_file) and os.path.getsize(out_file) > 100_000:
-                print(
-                    f"\n>>> Пропуск [{idx}/{len(shoot_dirs)}]: итоговый файл уже существует ({out_file})"
-                )
-                continue
 
             sub_work = os.path.join(args.work_dir, rel_name) if args.work_dir else None
             print(f"\n>>> Обработка [{idx}/{len(shoot_dirs)}]: {s_dir} -> {out_file}")
@@ -417,6 +545,7 @@ def main() -> None:
                 config=config,
                 work_dir=sub_work,
                 keep_temp=args.keep_temp,
+                skip_existing=skip_existing,
             )
 
 
