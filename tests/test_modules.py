@@ -16,6 +16,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from scripts.async_pipeline import run_async_pipeline
 from scripts.run_pipeline import (
     default_output_path_for_shoot,
     derive_series_output_path,
@@ -35,6 +36,11 @@ from src.stitcher.pto_generator import (
     filter_sky_control_points,
     generate_initial_pto,
     order_frames_with_horizon_anchor,
+)
+from src.storage.s3_downloader import (
+    load_dotenv_file,
+    parse_asana_task_string,
+    write_dotenv_file,
 )
 
 
@@ -258,7 +264,98 @@ def run_all_tests() -> None:
     expected_second_out = os.path.join(series_dir, f"{folder_name}_2_full.jpeg")
     assert os.path.normcase(second_series_out) == os.path.normcase(expected_second_out)
 
-    print("[TEST PASS] Все тесты метаданных, разделения серий, астрономии, initial.pto, RMS, фильтрации точек неба и Sanity Check прошли успешно!")
+    # 5. Тесты парсера задач Asana, работы с .env и асинхронного конвейера (keep_raw=True / False)
+    t1 = parse_asana_task_string("Panorama: customer_a/site_b/2026-10-31_01")
+    assert t1["customer"] == "customer_a" and t1["site"] == "site_b" and t1["date"] == "2026-10-31_01"
+    assert t1["s3_prefix"] == "customer_a/site_b/panoramas/2026-10-31_01/input/"
+
+    t2 = parse_asana_task_string("anorama: customer_a/site_b/2026-10-31_02")
+    assert t2["relative_dir"] == "customer_a/site_b/2026-10-31_02"
+
+    t3 = parse_asana_task_string("s3://internals.traceair.net/cust_x/site_y/panoramas/2026-11-01_03/input")
+    assert t3["bucket"] == "internals.traceair.net"
+    assert t3["customer"] == "cust_x" and t3["site"] == "site_y" and t3["date"] == "2026-11-01_03"
+
+    with tempfile.TemporaryDirectory(prefix="phauto_async_test_") as async_tmp:
+        env_test_path = os.path.join(async_tmp, ".env")
+        write_dotenv_file(
+            env_test_path,
+            {
+                "AWS_ACCESS_KEY_ID": "ASIATEST123456789",
+                "AWS_SECRET_ACCESS_KEY": "secret_test_xyz",
+                "AWS_SESSION_TOKEN": "IQoJb3JpZ2luX2VjE_test_token",
+                "AWS_DEFAULT_REGION": "us-east-1",
+            },
+        )
+        loaded_env = load_dotenv_file(env_test_path, override=False)
+        assert loaded_env["AWS_ACCESS_KEY_ID"] == "ASIATEST123456789"
+        assert loaded_env["AWS_DEFAULT_REGION"] == "us-east-1"
+
+        # Проверяем работу clean_env при наличии старых ключей в os.environ
+        from src.storage.s3_downloader import _clean_aws_env
+        test_dirty = {"AWS_ACCESS_KEY_ID": "OLD", "AWS_SECRET_ACCESS_KEY": "OLD_SEC", "PATH": "C:\\bin"}
+        cleaned = _clean_aws_env(test_dirty)
+        assert "AWS_ACCESS_KEY_ID" not in cleaned and "AWS_SECRET_ACCESS_KEY" not in cleaned
+        assert cleaned["PATH"] == "C:\\bin"
+
+        created_raw_dirs: list[str] = []
+
+        def _fake_download_fn(task_info: dict, dest_dir: str, **kwargs):
+            os.makedirs(dest_dir, exist_ok=True)
+            dummy_raw = os.path.join(dest_dir, "DJI_0001.JPG")
+            with open(dummy_raw, "wb") as f:
+                f.write(b"dummy_raw_frame")
+            created_raw_dirs.append(dest_dir)
+            return {
+                **task_info,
+                "dest_dir": os.path.abspath(dest_dir),
+                "total_files": 1,
+                "downloaded_files": 1,
+                "skipped_files": 0,
+                "total_bytes": 15,
+                "elapsed_sec": 0.01,
+            }
+
+        def _fake_stitch_fn(job_payload: dict):
+            raw_input_dir = job_payload["input_dir"]
+            output_jpeg_path = job_payload["output_jpg_path"]
+            assert os.path.isdir(raw_input_dir), "Raw input directory must exist during stitching"
+            os.makedirs(os.path.dirname(output_jpeg_path), exist_ok=True)
+            with open(output_jpeg_path, "wb") as f:
+                f.write(b"fake_panorama_jpeg")
+            return {
+                "series_count": 1,
+                "output_paths": [output_jpeg_path],
+                "elapsed_sec": 0.01,
+                "reports": [{"output_path": output_jpeg_path}],
+            }
+
+        import asyncio
+
+        # Проверяем режим keep_raw=False (скачивание во временную папку и её автоудаление после склейки)
+        out_root_temp_mode = os.path.join(async_tmp, "pano_temp_mode")
+        res_temp = asyncio.run(
+            run_async_pipeline(
+                task_strings=["cust1/site1/2026-10-31_01", "cust1/site1/2026-10-31_02"],
+                pano_root=out_root_temp_mode,
+                sky_dir=os.path.join(PROJECT_ROOT, "sky"),
+                catalog={"skies": []},
+                config=config,
+                env_path=env_test_path,
+                keep_raw=False,
+                prefetch_limit=2,
+                stitch_workers=1,
+                download_fn=_fake_download_fn,
+                stitch_fn=_fake_stitch_fn,
+            )
+        )
+        assert len(res_temp["completed"]) == 2 and len(res_temp["failed"]) == 0
+        for raw_d in created_raw_dirs:
+            assert not os.path.exists(raw_d), f"Temporary raw dir {raw_d} must be deleted after stitching"
+        final_pano_1 = os.path.join(out_root_temp_mode, "cust1", "site1", "2026-10-31_01", "2026-10-31_01_full.jpeg")
+        assert os.path.isfile(final_pano_1), "Final stitched panorama must remain in output folder"
+
+    print("[TEST PASS] Все тесты метаданных, разделения серий, астрономии, initial.pto, RMS, фильтрации точек неба, Sanity Check и асинхронного S3-конвейера прошли успешно!")
 
 
 if __name__ == "__main__":

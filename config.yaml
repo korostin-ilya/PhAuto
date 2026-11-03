@@ -86,3 +86,11 @@ sky_blender:
   reinhard_zenith_weight_ratio: 0.42
   max_ab_shift: 18.0
   max_l_shift: 22.0
+
+s3_downloader:
+  default_bucket: "internals.traceair.net"
+  default_region: "us-west-1"
+  keep_raw_frames: true
+  max_download_threads: 8
+  max_retries: 3
+  temp_prefetch_limit: 2
