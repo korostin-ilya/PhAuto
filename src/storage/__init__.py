@@ -7,6 +7,7 @@ from src.storage.s3_downloader import (
     ensure_aws_env_credentials,
     load_dotenv_file,
     parse_asana_task_string,
+    update_dotenv_vars,
     write_dotenv_file,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "ensure_aws_env_credentials",
     "load_dotenv_file",
     "parse_asana_task_string",
+    "update_dotenv_vars",
     "write_dotenv_file",
 ]

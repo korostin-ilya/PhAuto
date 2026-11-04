@@ -278,6 +278,9 @@ def run_all_tests() -> None:
 
     with tempfile.TemporaryDirectory(prefix="phauto_async_test_") as async_tmp:
         env_test_path = os.path.join(async_tmp, ".env")
+        with open(env_test_path, "w", encoding="utf-8") as f:
+            f.write("ASANA_PAT=2/test_asana_pat_123\nTRACEAIR_SESS_ID=s%3Atest_session_cookie\n")
+
         write_dotenv_file(
             env_test_path,
             {
@@ -290,6 +293,8 @@ def run_all_tests() -> None:
         loaded_env = load_dotenv_file(env_test_path, override=False)
         assert loaded_env["AWS_ACCESS_KEY_ID"] == "ASIATEST123456789"
         assert loaded_env["AWS_DEFAULT_REGION"] == "us-east-1"
+        assert loaded_env["ASANA_PAT"] == "2/test_asana_pat_123", "ASANA_PAT must be preserved when updating AWS keys"
+        assert loaded_env["TRACEAIR_SESS_ID"] == "s%3Atest_session_cookie", "TRACEAIR_SESS_ID must be preserved"
 
         # Проверяем работу clean_env при наличии старых ключей в os.environ
         from src.storage.s3_downloader import _clean_aws_env
@@ -298,7 +303,30 @@ def run_all_tests() -> None:
         assert "AWS_ACCESS_KEY_ID" not in cleaned and "AWS_SECRET_ACCESS_KEY" not in cleaned
         assert cleaned["PATH"] == "C:\\bin"
 
+        # Проверяем изолированный сервис src/magic_service (если подключён)
+        from src.magic_service import find_primary_panorama_file, parse_asana_tasks_payload
+
+        sample_asana_payload = [
+            {
+                "gid": "120001",
+                "name": "For Panorama cust1/site1/2026-10-31_01",
+                "notes": "Link: https://magic.traceair.net/cust1/site1/11111111-2222-3333-4444-555555555555",
+                "completed": False,
+            },
+            {
+                "gid": "120002",
+                "name": "Panorama: cust1/site1/2026-10-31_02",
+                "notes": "https://magic.traceair.net/cust1/site1/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "completed": False,
+            },
+        ]
+        parsed_asana = parse_asana_tasks_payload(sample_asana_payload)
+        assert len(parsed_asana) == 2
+        assert parsed_asana[0]["card_id"] == "11111111-2222-3333-4444-555555555555"
+        assert parsed_asana[1]["relative_dir"] == "cust1/site1/2026-10-31_02"
+
         created_raw_dirs: list[str] = []
+        published_calls: list[dict] = []
 
         def _fake_download_fn(task_info: dict, dest_dir: str, **kwargs):
             os.makedirs(dest_dir, exist_ok=True)
@@ -321,19 +349,29 @@ def run_all_tests() -> None:
             output_jpeg_path = job_payload["output_jpg_path"]
             assert os.path.isdir(raw_input_dir), "Raw input directory must exist during stitching"
             os.makedirs(os.path.dirname(output_jpeg_path), exist_ok=True)
+            # Записываем >100 КБ для прохождения проверки размера готовой панорамы
             with open(output_jpeg_path, "wb") as f:
-                f.write(b"fake_panorama_jpeg")
+                f.write(b"x" * 150_000)
+            # Имитируем наличие второй серии _2_full.jpeg в той же папке
+            second_out = output_jpeg_path.replace("_full.jpeg", "_2_full.jpeg")
+            with open(second_out, "wb") as f:
+                f.write(b"y" * 150_000)
             return {
-                "series_count": 1,
-                "output_paths": [output_jpeg_path],
+                "series_count": 2,
+                "output_paths": [output_jpeg_path, second_out],
                 "elapsed_sec": 0.01,
-                "reports": [{"output_path": output_jpeg_path}],
+                "reports": [{"output_path": output_jpeg_path}, {"output_path": second_out}],
             }
+
+        def _fake_publish_fn(task: dict, local_file: str, **kwargs):
+            published_calls.append({"task": task, "local_file": str(local_file)})
+            return {"status": "published", "card_id": task["card_id"], "local_file": str(local_file)}
 
         import asyncio
 
-        # Проверяем режим keep_raw=False (скачивание во временную папку и её автоудаление после склейки)
+        # Проверяем режим keep_raw=False + сквозную автопубликацию (auto_publish=True)
         out_root_temp_mode = os.path.join(async_tmp, "pano_temp_mode")
+        meta_map = {item["relative_dir"]: item for item in parsed_asana}
         res_temp = asyncio.run(
             run_async_pipeline(
                 task_strings=["cust1/site1/2026-10-31_01", "cust1/site1/2026-10-31_02"],
@@ -347,13 +385,20 @@ def run_all_tests() -> None:
                 stitch_workers=1,
                 download_fn=_fake_download_fn,
                 stitch_fn=_fake_stitch_fn,
+                asana_tasks_meta=meta_map,
+                auto_publish=True,
+                publish_fn=_fake_publish_fn,
             )
         )
         assert len(res_temp["completed"]) == 2 and len(res_temp["failed"]) == 0
+        assert len(res_temp["published"]) == 2 and len(published_calls) == 2
         for raw_d in created_raw_dirs:
             assert not os.path.exists(raw_d), f"Temporary raw dir {raw_d} must be deleted after stitching"
         final_pano_1 = os.path.join(out_root_temp_mode, "cust1", "site1", "2026-10-31_01", "2026-10-31_01_full.jpeg")
         assert os.path.isfile(final_pano_1), "Final stitched panorama must remain in output folder"
+        # Убеждаемся, что find_primary_panorama_file выбирает именно первую основную панораму (_full.jpeg, а не _2_full.jpeg)
+        primary_found = find_primary_panorama_file(out_root_temp_mode, "cust1", "site1", "2026-10-31_01")
+        assert primary_found is not None and os.path.normcase(str(primary_found)) == os.path.normcase(final_pano_1)
 
     print("[TEST PASS] Все тесты метаданных, разделения серий, астрономии, initial.pto, RMS, фильтрации точек неба, Sanity Check и асинхронного S3-конвейера прошли успешно!")
 

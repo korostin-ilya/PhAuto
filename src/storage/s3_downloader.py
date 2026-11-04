@@ -59,6 +59,60 @@ def load_dotenv_file(env_path: str, override: bool = True) -> dict[str, str]:
     return loaded
 
 
+def update_dotenv_vars(env_path: str, updates: dict[str, str]) -> str:
+    """
+    Обновляет или добавляет переданные переменные в файл .env,
+    сохраняя все остальные уже существующие в .env переменные (например, ASANA_PAT, TRACEAIR_SESS_ID, AWS_*).
+    Также синхронизирует обновлённые значения с os.environ.
+    """
+    abs_env = os.path.abspath(env_path)
+    os.makedirs(os.path.dirname(abs_env), exist_ok=True)
+
+    existing: dict[str, str] = {}
+    if os.path.isfile(abs_env):
+        existing = load_dotenv_file(abs_env, override=False)
+
+    for k, v in updates.items():
+        clean_k = str(k).strip()
+        if not clean_k:
+            continue
+        clean_v = str(v).strip()
+        if clean_v:
+            existing[clean_k] = clean_v
+            os.environ[clean_k] = clean_v
+        else:
+            existing.pop(clean_k, None)
+            os.environ.pop(clean_k, None)
+
+    aws_order = (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_DEFAULT_REGION",
+    )
+    aws_lines: list[str] = []
+    for k in aws_order:
+        if k in existing and existing[k]:
+            aws_lines.append(f"{k}={existing[k]}")
+
+    other_lines: list[str] = []
+    for k, v in existing.items():
+        if k not in aws_order and v:
+            other_lines.append(f"{k}={v}")
+
+    output_blocks: list[str] = []
+    if aws_lines:
+        output_blocks.append("\n".join(aws_lines))
+    if other_lines:
+        output_blocks.append("\n".join(other_lines))
+
+    content = "\n\n".join(output_blocks) + ("\n" if output_blocks else "")
+    with open(abs_env, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+
+    return abs_env
+
+
 def write_dotenv_file(env_path: str, creds: dict[str, str]) -> str:
     """
     Записывает ключи AWS в корневой файл .env в формате:
@@ -66,36 +120,23 @@ def write_dotenv_file(env_path: str, creds: dict[str, str]) -> str:
         AWS_SECRET_ACCESS_KEY=...
         AWS_SESSION_TOKEN=IQoJb3JpZ2luX2VjE...
         AWS_DEFAULT_REGION=us-east-1
+    сохраняя при этом все остальные переменные в .env (ASANA_PAT, TRACEAIR_SESS_ID и др.),
     и обновляет os.environ.
     """
-    abs_env = os.path.abspath(env_path)
-    os.makedirs(os.path.dirname(abs_env), exist_ok=True)
-
     access_key = creds.get("AWS_ACCESS_KEY_ID", "").strip()
     secret_key = creds.get("AWS_SECRET_ACCESS_KEY", "").strip()
     session_token = creds.get("AWS_SESSION_TOKEN", "").strip()
     region = creds.get("AWS_DEFAULT_REGION", DEFAULT_AWS_REGION).strip() or DEFAULT_AWS_REGION
 
-    lines = [
-        f"AWS_ACCESS_KEY_ID={access_key}",
-        f"AWS_SECRET_ACCESS_KEY={secret_key}",
-    ]
-    if session_token:
-        lines.append(f"AWS_SESSION_TOKEN={session_token}")
-    lines.append(f"AWS_DEFAULT_REGION={region}")
-
-    with open(abs_env, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines) + "\n")
-
-    os.environ["AWS_ACCESS_KEY_ID"] = access_key
-    os.environ["AWS_SECRET_ACCESS_KEY"] = secret_key
-    if session_token:
-        os.environ["AWS_SESSION_TOKEN"] = session_token
-    elif "AWS_SESSION_TOKEN" in os.environ:
-        del os.environ["AWS_SESSION_TOKEN"]
-    os.environ["AWS_DEFAULT_REGION"] = region
-
-    return abs_env
+    return update_dotenv_vars(
+        env_path,
+        {
+            "AWS_ACCESS_KEY_ID": access_key,
+            "AWS_SECRET_ACCESS_KEY": secret_key,
+            "AWS_SESSION_TOKEN": session_token,
+            "AWS_DEFAULT_REGION": region,
+        },
+    )
 
 
 def _clean_aws_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -313,8 +354,8 @@ def parse_asana_task_string(
             "relative_dir": f"{customer}/{site}/{date_number}",
         }
 
-    # Очистка префиксов вида "Panorama: ", "anorama: ", ": " и пробелов как в оригинальном батнике
-    s = re.sub(r"^[pP]?a?n?o?r?a?m?a?:\s*", "", s)
+    # Очистка префиксов вида "For Panorama ", "Panorama: ", "anorama: ", ": " и пробелов
+    s = re.sub(r"^(?:for\s+)?[pP]?a?n?o?r?a?m?a?:?\s*", "", s, flags=re.IGNORECASE)
     s = s.lstrip(": ").strip()
     s = s.replace("\\", "/").replace(" ", "")
 
