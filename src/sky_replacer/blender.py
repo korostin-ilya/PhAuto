@@ -744,25 +744,70 @@ def blend_sky_with_panorama(
     return pano_bgr, blend_stats
 
 
+def _inject_exif_into_jpeg_bytes(data: bytes, exif_bytes: bytes) -> bytes:
+    """Встраивает APP1-сегмент с EXIF в байтовый буфер JPEG сразу после маркера SOI (0xFFD8)."""
+    if len(data) < 4 or data[:2] != b"\xff\xd8" or not exif_bytes:
+        return data
+    exif_payload = exif_bytes if exif_bytes.startswith(b"Exif\x00\x00") else (b"Exif\x00\x00" + exif_bytes)
+    seg_len = len(exif_payload) + 2
+    if seg_len > 65535:
+        return data
+    app1_exif = b"\xff\xe1" + seg_len.to_bytes(2, "big") + exif_payload
+    return data[:2] + app1_exif + data[2:]
+
+
 def save_panorama_jpeg(
     pano_bgr: np.ndarray,
     output_path: str,
     quality: int = 96,
     subsampling: int = 0,
     exif_bytes: bytes | None = None,
+    xmp_packet: bytes | None = None,
 ) -> None:
     """
     Сохраняет итоговую панораму 15000x7500 в JPEG максимального качества
     с субдискретизацией хромы 4:4:4 (subsampling=0) для сохранения четкости проводов ЛЭП
     и мелких деталей.
+    Кодирует JPEG, EXIF и XMP в памяти и сбрасывает файл на диск за один проход.
     """
+    import io
+    from src.metadata import inject_xmp_into_jpeg_bytes
+
     pano_rgb = cv2.cvtColor(pano_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(pano_rgb)
-    save_kwargs: dict[str, Any] = {
-        "format": "JPEG",
-        "quality": int(quality),
-        "subsampling": int(subsampling),
-    }
-    if exif_bytes:
-        save_kwargs["exif"] = exif_bytes
-    pil_img.save(output_path, **save_kwargs)
+    jpeg_bytes: bytes | None = None
+
+    try:
+        import pyvips
+
+        h, w = pano_rgb.shape[:2]
+        vips_img = pyvips.Image.new_from_memory(
+            np.ascontiguousarray(pano_rgb).data, w, h, 3, "uchar"
+        )
+        raw_buf = vips_img.jpegsave_buffer(
+            Q=int(quality),
+            subsample_mode="off" if int(subsampling) == 0 else "on",
+        )
+        jpeg_bytes = bytes(raw_buf)
+        if exif_bytes:
+            jpeg_bytes = _inject_exif_into_jpeg_bytes(jpeg_bytes, exif_bytes)
+    except Exception:
+        jpeg_bytes = None
+
+    if jpeg_bytes is None:
+        pil_img = Image.fromarray(pano_rgb)
+        save_kwargs: dict[str, Any] = {
+            "format": "JPEG",
+            "quality": int(quality),
+            "subsampling": int(subsampling),
+        }
+        if exif_bytes:
+            save_kwargs["exif"] = exif_bytes
+        buf = io.BytesIO()
+        pil_img.save(buf, **save_kwargs)
+        jpeg_bytes = buf.getvalue()
+
+    if xmp_packet:
+        jpeg_bytes = inject_xmp_into_jpeg_bytes(jpeg_bytes, xmp_packet)
+
+    with open(output_path, "wb") as f:
+        f.write(jpeg_bytes)

@@ -519,44 +519,52 @@ def upload_panorama_to_bo_storage(
         raise RuntimeError(f"Не удалось получить UploadId от bo-storage: {init_resp.text[:300]}")
     upload_id = match.group(1)
 
-    # 3. Загружаем локальный файл частями по 5 МБ с ретраями
+    # 3. Загружаем локальный файл частями по 5 МБ (параллельно в 4 потока) с ретраями
     file_size_mb = round(resolved_file.stat().st_size / (1024 * 1024), 1)
     print(f"  [Magic 3/5] {customer}/{site}/{pano_id}: отправка {resolved_file.name} ({file_size_mb} МБ) по частям...")
-    parts_xml: list[str] = []
+    chunks_to_upload: list[tuple[int, bytes]] = []
     part_number = 1
 
     with open(resolved_file, "rb") as f:
         while chunk := f.read(chunk_size):
-            part_url = f"{base_upload_url}?partNumber={part_number}&uploadId={upload_id}"
-            etag: str | None = None
-            last_err: Exception | None = None
-            for attempt in range(1, max_chunk_retries + 1):
-                try:
-                    put_resp = _http_request(
-                        "PUT",
-                        part_url,
-                        headers={**headers_auth, "Content-Type": "application/octet-stream"},
-                        data=chunk,
-                        timeout=120.0,
-                    )
-                    put_resp.raise_for_status()
-                    etag = put_resp.get_header("ETag")
-                    if not etag:
-                        raise RuntimeError("Сервер bo-storage не вернул заголовок ETag.")
-                    break
-                except Exception as exc:
-                    last_err = exc
-                    if attempt < max_chunk_retries:
-                        print(f"    [!] Сбой загрузки части {part_number} (попытка {attempt}/{max_chunk_retries}): {exc}")
-                        time.sleep(2.0 * attempt)
-                    else:
-                        raise RuntimeError(
-                            f"Не удалось загрузить часть {part_number} после {max_chunk_retries} попыток: {last_err}"
-                        ) from exc
-
-            print(f"    -> [{pano_id}] Часть {part_number} загружена (ETag: {etag})")
-            parts_xml.append(f"<Part><ETag>{etag}</ETag><PartNumber>{part_number}</PartNumber></Part>")
+            chunks_to_upload.append((part_number, chunk))
             part_number += 1
+
+    def _upload_single_part(item: tuple[int, bytes]) -> tuple[int, str]:
+        p_num, data_bytes = item
+        part_url = f"{base_upload_url}?partNumber={p_num}&uploadId={upload_id}"
+        last_err: Exception | None = None
+        for attempt in range(1, max_chunk_retries + 1):
+            try:
+                put_resp = _http_request(
+                    "PUT",
+                    part_url,
+                    headers={**headers_auth, "Content-Type": "application/octet-stream"},
+                    data=data_bytes,
+                    timeout=120.0,
+                )
+                put_resp.raise_for_status()
+                etag = put_resp.get_header("ETag")
+                if not etag:
+                    raise RuntimeError("Сервер bo-storage не вернул заголовок ETag.")
+                print(f"    -> [{pano_id}] Часть {p_num}/{len(chunks_to_upload)} загружена (ETag: {etag})")
+                return p_num, f"<Part><ETag>{etag}</ETag><PartNumber>{p_num}</PartNumber></Part>"
+            except Exception as exc:
+                last_err = exc
+                if attempt < max_chunk_retries:
+                    print(f"    [!] Сбой загрузки части {p_num} (попытка {attempt}/{max_chunk_retries}): {exc}")
+                    time.sleep(2.0 * attempt)
+                else:
+                    raise RuntimeError(
+                        f"Не удалось загрузить часть {p_num} после {max_chunk_retries} попыток: {last_err}"
+                    ) from exc
+        raise RuntimeError(f"Не удалось загрузить часть {p_num}")
+
+    max_part_workers = min(4, max(1, len(chunks_to_upload)))
+    with ThreadPoolExecutor(max_workers=max_part_workers) as pool:
+        uploaded_parts = list(pool.map(_upload_single_part, chunks_to_upload))
+    uploaded_parts.sort(key=lambda x: x[0])
+    parts_xml = [xml_str for _, xml_str in uploaded_parts]
 
     complete_xml = (
         '<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'

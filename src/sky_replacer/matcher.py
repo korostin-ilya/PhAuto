@@ -15,6 +15,9 @@ from src.sky_replacer.signature import (
     read_image_bgr,
 )
 
+# Кэш уменьшенных превью шаблонов неба (600x150 BGR) в памяти процесса для мгновенного Stage 2
+_SKY_THUMB_BGR_CACHE: dict[tuple[str, int, int], np.ndarray] = {}
+
 
 def _wasserstein_1d_hist(h1: list[float], h2: list[float], value_range: float = 100.0) -> float:
     """Точное 1D расстояние Вассерштейна (Earth Mover's Distance) для нормированных гистограмм с равными бинами."""
@@ -361,8 +364,12 @@ def select_best_sky_template(
         if not os.path.isfile(full_path) and os.path.isfile(entry.get("path", "")):
             full_path = entry["path"]
 
-        sky_bgr = read_image_bgr(full_path, max_width=mb_w)
-        sky_small_bgr = cv2.resize(sky_bgr, (mb_w, mb_h), interpolation=cv2.INTER_AREA)
+        cache_key = (os.path.abspath(full_path), mb_w, mb_h)
+        sky_small_bgr = _SKY_THUMB_BGR_CACHE.get(cache_key)
+        if sky_small_bgr is None:
+            sky_bgr = read_image_bgr(full_path, max_width=mb_w)
+            sky_small_bgr = cv2.resize(sky_bgr, (mb_w, mb_h), interpolation=cv2.INTER_AREA)
+            _SKY_THUMB_BGR_CACHE[cache_key] = sky_small_bgr
         sky_small_shifted = np.roll(sky_small_bgr, shift=shift_to_pano_small, axis=1)
         sky_small_lab = bgr_to_cie_lab(sky_small_shifted)
 

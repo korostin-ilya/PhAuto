@@ -76,6 +76,44 @@ def _run_stitch_worker_task(job_payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def check_auto_publish_qc_gate(
+    stitch_res: dict[str, Any] | None,
+    config: dict[str, Any],
+) -> tuple[bool, str]:
+    """
+    Проверяет метрики качества сшивки (Auto-QC Gate) перед автоматической публикацией в Magic:
+    - RMS ошибка контрольных точек не превышает stitcher.auto_publish_max_rms_px (по умолчанию 12.0 px)
+    - Число сброшенных по Sanity Check кадров не превышает stitcher.auto_publish_max_reset_frames (по умолчанию 4)
+    Возвращает (passed, reason).
+    """
+    if not isinstance(stitch_res, dict):
+        return True, "ok"
+    stitch_cfg = config.get("stitcher", {})
+    max_rms_px = float(stitch_cfg.get("auto_publish_max_rms_px", 12.0))
+    max_reset_frames = int(stitch_cfg.get("auto_publish_max_reset_frames", 4))
+
+    stitch_stats = stitch_res.get("stitch_stats", {})
+    if not isinstance(stitch_stats, dict):
+        return True, "ok"
+
+    cp_rms = stitch_stats.get("cp_rms", {})
+    rms_px = float(cp_rms.get("rms_px", 0.0)) if isinstance(cp_rms, dict) else 0.0
+
+    sanity = stitch_stats.get("sanity_check", {})
+    reset_frames = sanity.get("reset_frames", []) if isinstance(sanity, dict) else []
+    num_reset = len(reset_frames) if isinstance(reset_frames, list) else 0
+
+    reasons: list[str] = []
+    if max_rms_px > 0 and rms_px > max_rms_px:
+        reasons.append(f"RMS={rms_px:.2f}px > порога {max_rms_px:.1f}px")
+    if max_reset_frames >= 0 and num_reset > max_reset_frames:
+        reasons.append(f"Sanity reset кадров={num_reset} > порога {max_reset_frames}")
+
+    if reasons:
+        return False, "; ".join(reasons)
+    return True, f"RMS={rms_px:.2f}px, reset={num_reset}"
+
+
 async def run_async_pipeline(
     task_strings: list[str],
     pano_root: str,
@@ -279,8 +317,14 @@ async def run_async_pipeline(
                     }
                 )
                 if can_auto_publish:
+                    qc_passed, qc_reason = check_auto_publish_qc_gate(stitch_res, config)
                     task_meta = meta_by_rel_dir.get(task_info["relative_dir"])
-                    if task_meta and task_meta.get("card_id"):
+                    if not qc_passed:
+                        print(
+                            f"  [Auto-QC Карантин] Панорама '{task_info['relative_dir']}' сохранена локально ('{out_path}'), "
+                            f"но автоматическая публикация в Magic остановлена для ручной проверки ({qc_reason})."
+                        )
+                    elif task_meta and task_meta.get("card_id"):
                         await publish_queue.put(
                             {
                                 "index": idx,

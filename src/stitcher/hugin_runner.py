@@ -95,7 +95,7 @@ def load_stitched_canvas_rgba(
     """
     y_offset: int | None = None
     x_offset: int = 0
-    arr: np.ndarray | None = None
+    raw_rgb: np.ndarray | None = None
 
     try:
         import tifffile
@@ -121,20 +121,43 @@ def load_stitched_canvas_rgba(
                     x_res = x_res[0] / x_res[1] if x_res[1] else 1.0
                 if x_res > 0 and x_pos >= 0:
                     x_offset = int(round(float(x_pos) * float(x_res)))
-            raw = page.asarray()
-            # tifffile возвращает RGB или RGBA
-            if raw.ndim == 3 and raw.shape[2] == 4:
-                arr = cv2.cvtColor(raw, cv2.COLOR_RGBA2BGRA)
-            elif raw.ndim == 3 and raw.shape[2] == 3:
-                arr = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+            loaded = page.asarray()
+            if loaded.ndim == 3 and loaded.shape[2] in (3, 4):
+                raw_rgb = loaded
     except Exception:
-        arr = None
+        raw_rgb = None
 
+    if raw_rgb is not None:
+        if raw_rgb.dtype == np.uint16:
+            raw_rgb = (raw_rgb >> 8).astype(np.uint8)
+        h_stitched, w_stitched = raw_rgb.shape[:2]
+        if y_offset is None or y_offset + h_stitched > pano_height or (y_offset == 0 and h_stitched < pano_height):
+            y_offset = max(0, pano_height - h_stitched)
+        if x_offset + w_stitched > pano_width:
+            x_offset = 0
+
+        pano_bgr = np.zeros((pano_height, pano_width, 3), dtype=np.uint8)
+        alpha_mask = np.zeros((pano_height, pano_width), dtype=np.uint8)
+
+        y_end = min(pano_height, y_offset + h_stitched)
+        x_end = min(pano_width, x_offset + w_stitched)
+        crop_h = y_end - y_offset
+        crop_w = x_end - x_offset
+
+        # Копируем RGB -> BGR напрямую в целевой холст без промежуточного 450 МБ буфера cvtColor
+        pano_bgr[y_offset:y_end, x_offset:x_end] = raw_rgb[:crop_h, :crop_w, 2::-1]
+        if raw_rgb.shape[2] == 4:
+            alpha_mask[y_offset:y_end, x_offset:x_end] = raw_rgb[:crop_h, :crop_w, 3]
+        else:
+            non_empty = np.any(raw_rgb[:crop_h, :crop_w, :3] > 0, axis=2)
+            alpha_mask[y_offset:y_end, x_offset:x_end] = np.where(non_empty, 255, 0).astype(np.uint8)
+        del raw_rgb
+        return pano_bgr, alpha_mask
+
+    buf = np.fromfile(stitched_tif_path, dtype=np.uint8)
+    arr = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
     if arr is None:
-        buf = np.fromfile(stitched_tif_path, dtype=np.uint8)
-        arr = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-        if arr is None:
-            raise RuntimeError(f"Не удалось прочитать сшитый файл {stitched_tif_path}")
+        raise RuntimeError(f"Не удалось прочитать сшитый файл {stitched_tif_path}")
 
     if arr.dtype == np.uint16:
         arr = (arr >> 8).astype(np.uint8)
@@ -269,7 +292,14 @@ def run_stitching_pipeline(
 
     created_temp = False
     if work_dir is None:
-        work_dir = tempfile.mkdtemp(prefix="drone_pano_stitch_")
+        shm_dir: str | None = None
+        if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+            try:
+                if shutil.disk_usage("/dev/shm").free >= 600 * 1024 * 1024:
+                    shm_dir = "/dev/shm"
+            except OSError:
+                shm_dir = None
+        work_dir = tempfile.mkdtemp(prefix="drone_pano_stitch_", dir=shm_dir)
         created_temp = True
     else:
         os.makedirs(work_dir, exist_ok=True)

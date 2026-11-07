@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Установка системных зависимостей: Hugin CLI, libvips, ExifTool и библиотек для сборки Multiblend
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv \
+    python3 python3-pip python3-venv python3-dev pkg-config \
     hugin-tools enblend \
     libvips-dev libimage-exiftool-perl \
     libgl1 libglib2.0-0 build-essential git cmake curl ca-certificates \
@@ -19,7 +19,6 @@ RUN mkdir -p /tmp/multiblend \
     && rm -rf /tmp/multiblend
 
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends python3-dev pkg-config && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 

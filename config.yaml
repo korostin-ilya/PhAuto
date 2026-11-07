@@ -23,6 +23,8 @@ stitcher:
   cpclean_threshold: 1.5
   max_angle_deviation_deg: 3.5
   max_eev_deviation: 2.5
+  auto_publish_max_rms_px: 12.0
+  auto_publish_max_reset_frames: 4
   use_gpu_nona: false
   use_vig_optimize: false
   use_cropped_tiff: true

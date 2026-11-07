@@ -21,6 +21,7 @@ if PROJECT_ROOT not in sys.path:
 
 from scripts.index_skies import build_sky_catalog, resolve_sky_dir
 from src.metadata import (
+    build_gpano_xmp_packet,
     compute_sun_position,
     get_reference_exif_bytes,
     inspect_shoot_directory,
@@ -255,7 +256,7 @@ def _execute_single_series_frames(
         f"Защищено объектов в зоне перехода={blend_stats['protected_tall_objects_ratio'] * 100:.1f}%"
     )
 
-    # 5. Сохранение JPEG 15000x7500 (4:4:4, quality=96) и запись метаданных EXIF/GPS + GPano XMP
+    # 5. Сохранение JPEG 15000x7500 (4:4:4, quality=96) и запись метаданных EXIF/GPS + GPano XMP за 1 проход
     t_save = time.time()
     os.makedirs(os.path.dirname(os.path.abspath(output_jpg_path)), exist_ok=True)
     ref_frame_path = frames_meta[0]["path"]
@@ -264,12 +265,18 @@ def _execute_single_series_frames(
         full_width=pano_width,
         full_height=pano_height,
     )
+    xmp_packet = build_gpano_xmp_packet(
+        full_width=pano_width,
+        full_height=pano_height,
+        pose_heading_deg=0.0,
+    )
     save_panorama_jpeg(
         pano_bgr=pano_bgr,
         output_path=output_jpg_path,
         quality=jpeg_quality,
         subsampling=subsampling,
         exif_bytes=exif_bytes,
+        xmp_packet=xmp_packet,
     )
     write_output_metadata(
         output_jpg_path=output_jpg_path,

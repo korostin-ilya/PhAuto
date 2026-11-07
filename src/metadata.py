@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -811,10 +812,21 @@ def inspect_shoot_directory(
     if not entries:
         raise FileNotFoundError(f"В папке {input_dir} не найдено JPEG-снимков.")
 
-    all_frames = [
-        extract_frame_metadata(os.path.join(input_dir, fname), default_hfov=default_hfov)
-        for fname in entries
-    ]
+    if len(entries) > 4:
+        with ThreadPoolExecutor(max_workers=min(8, len(entries))) as ex:
+            all_frames = list(
+                ex.map(
+                    lambda fname: extract_frame_metadata(
+                        os.path.join(input_dir, fname), default_hfov=default_hfov
+                    ),
+                    entries,
+                )
+            )
+    else:
+        all_frames = [
+            extract_frame_metadata(os.path.join(input_dir, fname), default_hfov=default_hfov)
+            for fname in entries
+        ]
     raw_frames, report = filter_series_frames(all_frames, filter_cfg=filter_cfg)
     min_raw = int((filter_cfg or {}).get("min_raw_frames", 5))
     raw_series = [s for s in report.get("raw_series", []) if len(s) >= min_raw]
@@ -996,13 +1008,10 @@ def build_gpano_xmp_packet(
     return xmp_xml.encode("utf-8")
 
 
-def _inject_xmp_into_jpeg_file(jpeg_path: str, xmp_packet: bytes) -> None:
-    """Встраивает APP1-сегмент с XMP-пакетом в JPEG без перекодирования изображения."""
-    with open(jpeg_path, "rb") as f:
-        data = f.read()
-
+def inject_xmp_into_jpeg_bytes(data: bytes, xmp_packet: bytes) -> bytes:
+    """Встраивает APP1-сегмент с XMP-пакетом в байтовый буфер JPEG в памяти без перекодирования изображения."""
     if len(data) < 4 or data[:2] != b"\xff\xd8":
-        return
+        return data
 
     xmp_header = b"http://ns.adobe.com/xap/1.0/\x00"
     payload = xmp_header + xmp_packet
@@ -1033,8 +1042,18 @@ def _inject_xmp_into_jpeg_file(jpeg_path: str, xmp_packet: bytes) -> None:
 
     cleaned_chunks.append(data[pos:])
     rebuilt = b"".join(cleaned_chunks)
-    final_bytes = rebuilt[:insert_pos] + app1_xmp + rebuilt[insert_pos:]
+    return rebuilt[:insert_pos] + app1_xmp + rebuilt[insert_pos:]
 
+
+def _inject_xmp_into_jpeg_file(jpeg_path: str, xmp_packet: bytes) -> None:
+    """Встраивает APP1-сегмент с XMP-пакетом в JPEG без перекодирования изображения."""
+    with open(jpeg_path, "rb") as f:
+        data = f.read()
+
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return
+
+    final_bytes = inject_xmp_into_jpeg_bytes(data, xmp_packet)
     with open(jpeg_path, "wb") as f:
         f.write(final_bytes)
 
@@ -1071,7 +1090,17 @@ def write_output_metadata(
     """
     Переносит геолокацию (GPSInfo), дату съемки и модель камеры из опорного снимка
     и вшивает XMP-теги Google Photo Sphere (GPano).
+    Если EXIF и GPano XMP уже были встроены в памяти на этапе save_panorama_jpeg,
+    пропускает повторную перезапись 65 МБ файла и внешний вызов exiftool.
     """
+    try:
+        with open(output_jpg_path, "rb") as f:
+            head = f.read(128 * 1024)
+        if b"GPano:UsePanoramaViewer" in head and b"Exif\x00\x00" in head:
+            return
+    except Exception:
+        pass
+
     xmp_packet = build_gpano_xmp_packet(
         full_width=full_width,
         full_height=full_height,

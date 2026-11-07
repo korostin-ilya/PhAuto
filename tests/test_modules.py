@@ -458,6 +458,49 @@ def run_all_tests() -> None:
         assert airtable_map["cust1/site1/2026-10-31_02"]["row_id"] == "recRow2"
         assert airtable_map["cust1/site1/2026-10-31_02"]["has_me_as_owner"] is False
 
+        # Проверяем Auto-QC Gate перед автоматической публикацией в Magic
+        from scripts.async_pipeline import check_auto_publish_qc_gate
+
+        qc_cfg = {"stitcher": {"auto_publish_max_rms_px": 12.0, "auto_publish_max_reset_frames": 4}}
+        ok_pass, _ = check_auto_publish_qc_gate(
+            {"stitch_stats": {"cp_rms": {"rms_px": 3.5}, "sanity_check": {"reset_frames": [1]}}},
+            qc_cfg,
+        )
+        assert ok_pass is True
+        ok_fail_rms, reason_rms = check_auto_publish_qc_gate(
+            {"stitch_stats": {"cp_rms": {"rms_px": 15.2}, "sanity_check": {"reset_frames": []}}},
+            qc_cfg,
+        )
+        assert ok_fail_rms is False and "RMS=15.20px" in reason_rms
+        ok_fail_reset, reason_reset = check_auto_publish_qc_gate(
+            {"stitch_stats": {"cp_rms": {"rms_px": 4.0}, "sanity_check": {"reset_frames": [1, 2, 3, 4, 5]}}},
+            qc_cfg,
+        )
+        assert ok_fail_reset is False and "Sanity reset кадров=5" in reason_reset
+
+        # Проверяем однопроходное сохранение JPEG с EXIF и GPano XMP в памяти
+        from src.metadata import build_gpano_xmp_packet, write_output_metadata
+        from src.sky_replacer.blender import save_panorama_jpeg
+
+        single_pass_jpg = os.path.join(tmp_root, "single_pass_test.jpg")
+        dummy_bgr = np.zeros((100, 200, 3), dtype=np.uint8)
+        xmp_pkt = build_gpano_xmp_packet(200, 100, 0.0)
+        save_panorama_jpeg(
+            pano_bgr=dummy_bgr,
+            output_path=single_pass_jpg,
+            quality=92,
+            subsampling=0,
+            exif_bytes=b"Exif\x00\x00II*\x00\x08\x00\x00\x00\x00\x00",
+            xmp_packet=xmp_pkt,
+        )
+        with open(single_pass_jpg, "rb") as f_jpg:
+            jpg_head = f_jpg.read(65536)
+        assert b"GPano:UsePanoramaViewer" in jpg_head
+        assert b"Exif\x00\x00" in jpg_head
+        mtime_before = os.path.getmtime(single_pass_jpg)
+        write_output_metadata(single_pass_jpg, single_pass_jpg, 200, 100)
+        assert os.path.getmtime(single_pass_jpg) == mtime_before, "write_output_metadata must skip rewrite when EXIF+XMP already present"
+
     print("[TEST PASS] Все тесты метаданных, разделения серий, астрономии, initial.pto, RMS, фильтрации точек неба, Sanity Check и асинхронного S3-конвейера прошли успешно!")
 
 
