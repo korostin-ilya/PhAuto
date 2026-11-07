@@ -98,7 +98,8 @@ def update_dotenv_vars(env_path: str, updates: dict[str, str]) -> str:
     other_lines: list[str] = []
     for k, v in existing.items():
         if k not in aws_order and v:
-            other_lines.append(f"{k}={v}")
+            formatted_v = f'"{v}"' if (" " in v or ";" in v) and not (v.startswith('"') and v.endswith('"')) else v
+            other_lines.append(f"{k}={formatted_v}")
 
     output_blocks: list[str] = []
     if aws_lines:

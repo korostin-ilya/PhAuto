@@ -321,11 +321,10 @@ async def run_async_pipeline(
         try:
             fin_res = await asyncio.to_thread(
                 magic_service.finalize_panorama_publication,
-                task=task_meta,
-                env_path=env_path,
-                poll_interval_sec=60.0,
+                up_res,
+                60.0,
             )
-            fin_res["file"] = up_res.get("file", "")
+            fin_res["file"] = up_res.get("local_file", up_res.get("file", ""))
             published_jobs.append(fin_res)
         except Exception as exc:
             print(f"[Ошибка финализации {idx}/{total}] '{rel_dir}': {exc}")
@@ -371,7 +370,7 @@ async def run_async_pipeline(
                         pano_root=pano_root,
                         env_path=env_path,
                     )
-                    if up_res.get("status") == "uploaded_pending_publication":
+                    if up_res.get("status") in ("copying_started", "uploaded_pending_publication"):
                         bg_task = asyncio.create_task(
                             _finalize_in_bg(idx, total, task_meta, up_res)
                         )
@@ -569,12 +568,11 @@ def _run_post_stitch_confirm_publish(
                     pano_root=pano_root,
                     env_path=env_path,
                 )
-                if up_res.get("status") == "uploaded_pending_publication":
+                if up_res.get("status") in ("copying_started", "uploaded_pending_publication"):
                     fut = finalize_pool.submit(
                         magic_service.finalize_panorama_publication,
-                        task=meta,
-                        env_path=env_path,
-                        poll_interval_sec=60.0,
+                        up_res,
+                        60.0,
                     )
                     pending_futures.append((meta, up_res, fut))
                 else:
@@ -590,7 +588,7 @@ def _run_post_stitch_confirm_publish(
             for meta, up_res, fut in pending_futures:
                 try:
                     fin_res = fut.result()
-                    fin_res["file"] = up_res.get("file", "")
+                    fin_res["file"] = up_res.get("local_file", up_res.get("file", ""))
                     published_results.append(fin_res)
                 except Exception as exc:
                     print(f"  [ОШИБКА финализации] {meta['relative_dir']}: {exc}")
@@ -640,6 +638,16 @@ def main() -> None:
         "--upload-only",
         action="store_true",
         help="Только опубликовать уже готовые локальные файлы панорам по открытым задачам из Asana (без сшивки)",
+    )
+    parser.add_argument(
+        "--airtable-only",
+        action="store_true",
+        help="Только назначить Owner ('Ilia Korostin') в Airtable для открытых задач из Asana",
+    )
+    parser.add_argument(
+        "--no-airtable",
+        action="store_true",
+        help="Отключить автоназначение Owner в Airtable",
     )
     parser.add_argument(
         "--no-publish",
@@ -764,11 +772,17 @@ def main() -> None:
             pano_root = os.path.join(PROJECT_ROOT, "pano")
     os.makedirs(pano_root, exist_ok=True)
 
-    # Если выбран режим только выгрузки готовых файлов (--upload-only), AWS S3 и Hugin не нужны
-    if args.upload_only:
+    # Если выбран режим только выгрузки готовых файлов (--upload-only) или только Airtable (--airtable-only),
+    # AWS S3 и Hugin не нужны
+    if args.upload_only or args.airtable_only:
         from scripts.publish_magic import run_standalone_publisher
 
-        run_standalone_publisher(pano_root=pano_root, env_path=args.env_file)
+        run_standalone_publisher(
+            pano_root=pano_root,
+            env_path=args.env_file,
+            airtable_only=args.airtable_only,
+            sync_airtable=not args.no_airtable,
+        )
         return
 
     # 2. Проверяем сессию AWS SSO и прокидываем ключи в корневой .env
@@ -814,12 +828,32 @@ def main() -> None:
         if publish_mode == "upload_only":
             from scripts.publish_magic import run_standalone_publisher
 
-            run_standalone_publisher(pano_root=pano_root, env_path=args.env_file)
+            run_standalone_publisher(
+                pano_root=pano_root,
+                env_path=args.env_file,
+                sync_airtable=not args.no_airtable,
+            )
             return
 
     if not tasks:
         print("[Конвейер] Список задач пуст. Завершение работы.")
         return
+
+    # 3b. Автоматически проставляем Owner ('Ilia Korostin') в Airtable для всех открытых задач из Asana
+    if (
+        magic_service is not None
+        and hasattr(magic_service, "sync_airtable_owners_for_tasks")
+        and not args.no_airtable
+        and (asana_meta_map or tasks)
+    ):
+        airtable_target_tasks = list(asana_meta_map.values()) if asana_meta_map else tasks
+        try:
+            magic_service.sync_airtable_owners_for_tasks(
+                tasks=airtable_target_tasks,
+                env_path=args.env_file,
+            )
+        except Exception as exc:
+            print(f"[Airtable Предупреждение] Не удалось синхронизировать Owner в Airtable: {exc}")
 
     if args.no_publish:
         publish_mode = "none"

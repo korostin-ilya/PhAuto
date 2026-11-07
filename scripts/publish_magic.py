@@ -29,6 +29,7 @@ from src.magic_service import (
     fetch_my_asana_tasks,
     finalize_panorama_publication,
     find_primary_panorama_file,
+    sync_airtable_owners_for_tasks,
     upload_panorama_to_bo_storage,
 )
 
@@ -37,6 +38,8 @@ def run_standalone_publisher(
     pano_root: str,
     env_path: str,
     list_only: bool = False,
+    airtable_only: bool = False,
+    sync_airtable: bool = True,
     filter_tasks: list[str] | None = None,
     include_already_uploaded: bool = False,
     poll_interval_sec: float = DEFAULT_POLL_INTERVAL_SEC,
@@ -57,6 +60,27 @@ def run_standalone_publisher(
             or t["pano_id"].lower() in norm_filters
             or any(f in t["relative_dir"].lower() for f in norm_filters)
         ]
+
+    airtable_summary: dict[str, Any] = {}
+    if tasks and (sync_airtable or airtable_only) and not list_only:
+        print("\n=== 1b. Назначение Owner в Airtable (Pano List) для открытых задач из Asana ===")
+        try:
+            airtable_summary = sync_airtable_owners_for_tasks(
+                tasks=tasks,
+                env_path=env_path,
+            )
+        except Exception as exc:
+            print(f"[Airtable Предупреждение] Не удалось синхронизировать Owner в Airtable: {exc}")
+
+    if airtable_only:
+        return {
+            "total_asana_tasks": len(tasks),
+            "ready_count": 0,
+            "airtable": airtable_summary,
+            "published": [],
+            "skipped": [],
+            "failed": [],
+        }
 
     ready_tasks: list[dict[str, Any]] = []
     missing_tasks: list[dict[str, Any]] = []
@@ -169,6 +193,16 @@ def main() -> None:
         help="Только вывести открытые задачи из Asana и статус локальных файлов без публикации",
     )
     parser.add_argument(
+        "--airtable-only",
+        action="store_true",
+        help="Только проставить Owner ('Ilia Korostin') в Airtable для открытых задач из Asana",
+    )
+    parser.add_argument(
+        "--no-airtable",
+        action="store_true",
+        help="Отключить автоназначение Owner в Airtable при публикации",
+    )
+    parser.add_argument(
         "--include-uploaded",
         action="store_true",
         help="Включать задачи, в комментариях которых уже есть отметка о загрузке на office.traceair.net",
@@ -200,6 +234,8 @@ def main() -> None:
         pano_root=pano_root,
         env_path=args.env_file,
         list_only=args.list_only,
+        airtable_only=args.airtable_only,
+        sync_airtable=not args.no_airtable,
         filter_tasks=args.filter,
         include_already_uploaded=args.include_uploaded,
         poll_interval_sec=args.poll_interval,

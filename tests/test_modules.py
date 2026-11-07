@@ -400,6 +400,64 @@ def run_all_tests() -> None:
         primary_found = find_primary_panorama_file(out_root_temp_mode, "cust1", "site1", "2026-10-31_01")
         assert primary_found is not None and os.path.normcase(str(primary_found)) == os.path.normcase(final_pano_1)
 
+        # Проверяем парсинг и нормализацию задач для Airtable
+        from src.magic_service.airtable_client import (
+            ASANA_NAME_COLUMN_ID,
+            MY_DISPLAY_NAME,
+            MY_FOREIGN_ROW_ID,
+            OWNER_COLUMN_ID,
+            TABLE_ID,
+            make_detail_b64,
+            normalize_asana_task_key,
+            parse_airtable_read_queries_payload,
+        )
+
+        assert normalize_asana_task_key("Panorama: cust1/site1/2026-10-31_01") == "cust1/site1/2026-10-31_01"
+        assert normalize_asana_task_key("For Panorama cust1/site1/2026-10-31_02") == "cust1/site1/2026-10-31_02"
+        detail_b64 = make_detail_b64("recp7i9iLrK1bj5mX")
+        assert not detail_b64.endswith("="), "Airtable detail base64 must strip trailing '='"
+
+        mock_airtable_payload = {
+            "msg": "SUCCESS",
+            "data": {
+                "querySlices": [
+                    {
+                        "tableId": TABLE_ID,
+                        "rowIds": ["recRow1", "recRow2"],
+                    }
+                ],
+                "tableDataById": {
+                    TABLE_ID: {
+                        "partialRowById": {
+                            "recRow1": {
+                                "id": "recRow1",
+                                "cellValuesByColumnId": {
+                                    ASANA_NAME_COLUMN_ID: "cust1/site1/2026-10-31_01",
+                                    OWNER_COLUMN_ID: [
+                                        {
+                                            "foreignRowId": MY_FOREIGN_ROW_ID,
+                                            "foreignRowDisplayName": MY_DISPLAY_NAME,
+                                        }
+                                    ],
+                                },
+                            },
+                            "recRow2": {
+                                "id": "recRow2",
+                                "cellValuesByColumnId": {
+                                    ASANA_NAME_COLUMN_ID: "cust1/site1/2026-10-31_02",
+                                },
+                            },
+                        }
+                    }
+                },
+            },
+        }
+        airtable_map = parse_airtable_read_queries_payload(mock_airtable_payload)
+        assert airtable_map["cust1/site1/2026-10-31_01"]["row_id"] == "recRow1"
+        assert airtable_map["cust1/site1/2026-10-31_01"]["has_me_as_owner"] is True
+        assert airtable_map["cust1/site1/2026-10-31_02"]["row_id"] == "recRow2"
+        assert airtable_map["cust1/site1/2026-10-31_02"]["has_me_as_owner"] is False
+
     print("[TEST PASS] Все тесты метаданных, разделения серий, астрономии, initial.pto, RMS, фильтрации точек неба, Sanity Check и асинхронного S3-конвейера прошли успешно!")
 
 
